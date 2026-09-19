@@ -78,7 +78,11 @@ export interface WindowsEventData {
   level: 'Information' | 'Warning' | 'Error' | 'Critical' | 'Audit Success' | 'Audit Failure';
   computer: string;
   user?: string;
+  userSid?: string;
+  accountName?: string;
+  recordId?: number;
   processName?: string;
+  processPath?: string;
   commandLine?: string;
   ipAddress?: string;
   taskCategory?: string;
@@ -91,12 +95,14 @@ export interface RecentFileData {
   filePath: string;
   targetPath?: string;
   extension: string;
+  fileExtension?: string;
   accessTime: string;
   creationTime?: string;
   fileSize?: number;
   sourceArtifact: 'LNK Shortcut' | 'JumpList' | 'Shellbag' | 'RecentDocs' | 'Office Recent' | 'OpenSaveMRU';
   volumeSerial?: string;
   workingDir?: string;
+  mruIndex?: number;
   isSuspicious?: boolean;
 }
 

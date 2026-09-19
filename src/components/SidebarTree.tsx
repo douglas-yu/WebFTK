@@ -305,9 +305,10 @@ function CategoryItem({
 }
 
 function TreeNode({ node, folders, selectedPath, onSelectPath, depth }: any) {
+  if (!node) return null;
   const [isOpen, setIsOpen] = useState(depth === 0);
   const isSelected = selectedPath === node.path;
-  const hasChildren = node.children.length > 0;
+  const hasChildren = Boolean(node.children && node.children.length > 0);
 
   return (
     <div>
@@ -332,7 +333,7 @@ function TreeNode({ node, folders, selectedPath, onSelectPath, depth }: any) {
       
       {isOpen && hasChildren && (
         <div className="animate-in fade-in slide-in-from-top-1 duration-200">
-          {node.children.map((childPath: string) => (
+          {(node.children || []).map((childPath: string) => folders && folders[childPath] ? (
             <TreeNode 
               key={childPath}
               node={folders[childPath]}
@@ -341,7 +342,7 @@ function TreeNode({ node, folders, selectedPath, onSelectPath, depth }: any) {
               onSelectPath={onSelectPath}
               depth={depth + 1}
             />
-          ))}
+          ) : null)}
         </div>
       )}
     </div>

@@ -24,11 +24,13 @@ import {
   AlertCircle,
   Terminal,
   Mail,
-  FolderGit2
+  FolderGit2,
+  Sparkles
 } from 'lucide-react';
 import { ArtifactAnalysisOptions, ForensicArtifact } from '../types';
 import { analyzeArtifactFiles } from '../lib/artifactParser';
 import { formatBytes } from '../lib/forensics';
+import { createSampleForensicFiles } from '../lib/sampleEvidence';
 
 interface LoadArtifactModalProps {
   isOpen: boolean;
@@ -96,6 +98,22 @@ export default function LoadArtifactModal({
 
   const removeFile = (index: number) => {
     setSelectedFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handleLoadSamples = () => {
+    const samples = createSampleForensicFiles();
+    setSelectedFiles(samples);
+    setOptions({
+      windowsEvents: true,
+      recentFiles: true,
+      pstEmails: true,
+      browserHistory: false,
+      usbDevices: false,
+      networkShares: false,
+      shellbags: false,
+      sqliteDb: false,
+      userAccounts: false,
+    });
   };
 
   const hasAnyOptionSelected = Object.values(options).some(Boolean);
@@ -173,9 +191,19 @@ export default function LoadArtifactModal({
                 <FileText className="w-3.5 h-3.5 text-blue-400" />
                 1. Select Evidence / Artifact Files
               </label>
-              <span className="text-[11px] text-zinc-500">
-                Processed locally in browser memory
-              </span>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleLoadSamples}
+                  className="text-xs text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1.5 px-2.5 py-1 rounded bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 transition-colors"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  Load Sample Evidence (EVTX, PST, LNK)
+                </button>
+                <span className="text-[11px] text-zinc-500">
+                  Local-only sandbox
+                </span>
+              </div>
             </div>
 
             <div>

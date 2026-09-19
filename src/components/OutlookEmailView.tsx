@@ -55,16 +55,17 @@ export default function OutlookEmailView({
   // Normalize artifacts into email objects
   const emailsWithArtifact = useMemo(() => {
     return emailArtifacts.map(art => {
+      const artDetails = art.details || {};
       const email: ExtractedEmail = art.emailData || {
         id: art.id,
-        from: (art.details['From'] as string) || art.value || 'unknown@sender.com',
-        fromName: (art.details['From'] as string)?.split('<')[0]?.trim() || art.name,
-        to: [(art.details['To'] as string) || 'analyst@organization.local'],
+        from: (artDetails['From'] as string) || art.value || 'unknown@sender.com',
+        fromName: (artDetails['From'] as string)?.split('<')[0]?.trim() || art.name,
+        to: [(artDetails['To'] as string) || 'analyst@organization.local'],
         subject: art.name.replace(/^Email:\s*/i, '') || 'Extracted Message',
         date: art.timestamp,
-        bodyText: art.rawText || art.value || art.description,
-        folder: (art.details['Folder'] as ExtractedEmail['folder']) || (art.isSuspicious ? 'Junk' : 'Inbox'),
-        hasAttachments: Boolean(art.details['Attachments Count'] && (art.details['Attachments Count'] as number) > 0),
+        bodyText: art.rawText || art.value || art.description || '',
+        folder: (artDetails['Folder'] as ExtractedEmail['folder']) || (art.isSuspicious ? 'Junk' : 'Inbox'),
+        hasAttachments: Boolean(artDetails['Attachments Count'] && (artDetails['Attachments Count'] as number) > 0),
         isPhishing: art.isSuspicious,
         phishingReason: art.suspiciousReason
       };
@@ -120,15 +121,15 @@ export default function OutlookEmailView({
       // Search query
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
-        const inSubj = email.subject.toLowerCase().includes(q);
-        const inFrom = email.from.toLowerCase().includes(q);
+        const inSubj = (email.subject || '').toLowerCase().includes(q);
+        const inFrom = (email.from || '').toLowerCase().includes(q);
         const inFromName = (email.fromName || '').toLowerCase().includes(q);
-        const inBody = email.bodyText.toLowerCase().includes(q);
-        const inTo = email.to.some(t => t.toLowerCase().includes(q));
+        const inBody = (email.bodyText || '').toLowerCase().includes(q);
+        const inTo = Array.isArray(email.to) ? email.to.some(t => (t || '').toLowerCase().includes(q)) : false;
         if (!inSubj && !inFrom && !inFromName && !inBody && !inTo) return false;
       }
       return true;
-    }).sort((a, b) => b.email.date.localeCompare(a.email.date));
+    }).sort((a, b) => (b.email.date || '').localeCompare(a.email.date || ''));
   }, [emailsWithArtifact, selectedFolder, filterSuspiciousOnly, filterAttachmentsOnly, searchQuery]);
 
   // Current selected email
@@ -146,18 +147,20 @@ export default function OutlookEmailView({
   };
 
   const handleExportEML = (email: ExtractedEmail) => {
+    const toRecipients = Array.isArray(email.to) ? email.to.join(', ') : (email.to || '');
+    const ccRecipients = Array.isArray(email.cc) && email.cc.length > 0 ? `Cc: ${email.cc.join(', ')}` : '';
     const emlContent = [
-      `From: ${email.fromName ? `"${email.fromName}" <${email.from}>` : email.from}`,
-      `To: ${email.to.join(', ')}`,
-      email.cc && email.cc.length > 0 ? `Cc: ${email.cc.join(', ')}` : '',
-      `Subject: ${email.subject}`,
-      `Date: ${email.date}`,
+      `From: ${email.fromName ? `"${email.fromName}" <${email.from}>` : (email.from || 'unknown@sender.com')}`,
+      `To: ${toRecipients}`,
+      ccRecipients,
+      `Subject: ${email.subject || 'No Subject'}`,
+      `Date: ${email.date || new Date().toISOString()}`,
       `Message-ID: ${email.messageId || `<${crypto.randomUUID()}@forensic.local>`}`,
       'MIME-Version: 1.0',
       'Content-Type: text/plain; charset=utf-8',
       'X-Forensic-Source: PST/OST Extracted Mailbox',
       '',
-      email.bodyText
+      email.bodyText || ''
     ].filter(Boolean).join('\r\n');
 
     const blob = new Blob([emlContent], { type: 'message/rfc822' });
@@ -459,7 +462,7 @@ export default function OutlookEmailView({
 
                   {/* Snippet preview */}
                   <p className="text-[11px] text-zinc-500 line-clamp-2 leading-tight">
-                    {email.bodyText.slice(0, 140)}
+                    {(email.bodyText || '').slice(0, 140)}
                   </p>
 
                   {/* Badges / indicators */}
@@ -525,22 +528,24 @@ export default function OutlookEmailView({
                 {/* Sender Identity & Metadata */}
                 <div className="flex items-start gap-3">
                   <div className="w-10 h-10 rounded-full bg-blue-900/40 border border-blue-700/50 flex items-center justify-center text-blue-300 font-bold text-sm shrink-0 uppercase">
-                    {(currentItem.email.fromName || currentItem.email.from).slice(0, 2)}
+                    {(currentItem.email.fromName || currentItem.email.from || 'EM').slice(0, 2)}
                   </div>
                   <div className="flex-1 min-w-0 space-y-0.5 text-xs">
                     <div className="flex items-baseline gap-2 flex-wrap">
                       <span className="font-bold text-zinc-100">
-                        {currentItem.email.fromName || currentItem.email.from}
+                        {currentItem.email.fromName || currentItem.email.from || 'Unknown Sender'}
                       </span>
                       <span className="text-zinc-500 font-mono text-[11px]">
-                        &lt;{currentItem.email.from}&gt;
+                        &lt;{currentItem.email.from || 'unknown@sender.com'}&gt;
                       </span>
                     </div>
 
                     <div className="flex items-center gap-2 text-zinc-400 text-[11px]">
                       <span className="text-zinc-500">To:</span>
-                      <span className="font-mono text-zinc-300">{currentItem.email.to.join(', ')}</span>
-                      {currentItem.email.cc && currentItem.email.cc.length > 0 && (
+                      <span className="font-mono text-zinc-300">
+                        {Array.isArray(currentItem.email.to) ? currentItem.email.to.join(', ') : (currentItem.email.to || '')}
+                      </span>
+                      {currentItem.email.cc && Array.isArray(currentItem.email.cc) && currentItem.email.cc.length > 0 && (
                         <>
                           <span className="text-zinc-500 ml-2">Cc:</span>
                           <span className="font-mono text-zinc-300">{currentItem.email.cc.join(', ')}</span>
@@ -583,7 +588,7 @@ export default function OutlookEmailView({
                       Attached Files ({currentItem.email.attachments?.length || 1})
                     </span>
                     <div className="flex flex-wrap gap-2">
-                      {currentItem.email.attachments ? (
+                      {currentItem.email.attachments && currentItem.email.attachments.length > 0 ? (
                         currentItem.email.attachments.map((att, idx) => (
                           <div 
                             key={idx}
@@ -594,8 +599,10 @@ export default function OutlookEmailView({
                             }`}
                           >
                             <Paperclip className={`w-3.5 h-3.5 ${att.isSuspicious ? 'text-red-400' : 'text-blue-400'}`} />
-                            <span className="font-medium">{att.name}</span>
-                            <span className="text-[10px] text-zinc-500">({Math.round(att.size / 1024)} KB)</span>
+                            <span className="font-medium">{att.name || (att as any).filename || 'Attachment'}</span>
+                            <span className="text-[10px] text-zinc-500">
+                              ({att.size ? `${Math.round(att.size / 1024)} KB` : 'Payload'})
+                            </span>
                             {att.isSuspicious && (
                               <span className="px-1 py-0.5 rounded bg-red-900/80 text-red-300 font-bold text-[8px]">
                                 SUSPICIOUS

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { Buffer } from 'buffer';
 import { 
   ForensicArtifact, 
   ArtifactAnalysisOptions, 
@@ -11,6 +12,8 @@ import {
   WindowsEventData,
   RecentFileData
 } from '../types';
+import { parseEvtxBinary, parseEvtxTextOrXml } from './evtxParser';
+import { parsePstOrMailboxBinary, parseEmailTextOrMime } from './pstParser';
 
 export interface CategoryMeta {
   id: ArtifactCategory;
@@ -100,29 +103,41 @@ async function readFileAsText(file: File, maxBytes = 4 * 1024 * 1024): Promise<s
 }
 
 // Helper to extract binary buffer safely
-async function readFileAsArrayBuffer(file: File, maxBytes = 4 * 1024 * 1024): Promise<ArrayBuffer> {
+async function readFileAsArrayBuffer(file: File, maxBytes = 64 * 1024 * 1024): Promise<ArrayBuffer> {
   const slice = file.slice(0, maxBytes);
   return await slice.arrayBuffer();
 }
 
-// Known Windows Security Event IDs map
-const KNOWN_EVENT_IDS: Record<number, { name: string; level: 'Information' | 'Warning' | 'Error' | 'Critical'; suspicious?: boolean; reason?: string }> = {
-  4624: { name: 'Successful User Logon', level: 'Information' },
-  4625: { name: 'An Account Failed to Log On (Logon Failure)', level: 'Warning', suspicious: true, reason: 'Failed authentication attempt - potential brute-force or credential spray indicator' },
-  4634: { name: 'An Account was Logged Off', level: 'Information' },
-  4672: { name: 'Special Privileges Assigned to New Logon', level: 'Information' },
-  4688: { name: 'A New Process has been Created', level: 'Information' },
-  4697: { name: 'A Service was Installed in the System', level: 'Warning', suspicious: true, reason: 'New Windows service registered - potential persistence mechanism' },
-  7045: { name: 'A New Service was Installed (System)', level: 'Warning', suspicious: true, reason: 'Service Control Manager installed new system service' },
-  1102: { name: 'The Audit Log was Cleared', level: 'Critical', suspicious: true, reason: 'CRITICAL: Security audit event log cleared to conceal malicious activities' },
-  4720: { name: 'A User Account was Created', level: 'Warning', suspicious: true, reason: 'New local user account provisioned on host' },
-  4728: { name: 'A Member was Added to a Security-Enabled Global Group', level: 'Warning', suspicious: true, reason: 'User added to privileged security group' },
-  4104: { name: 'PowerShell Script Block Logging Executed', level: 'Warning' },
-  4103: { name: 'PowerShell Module Logging Executed', level: 'Information' },
-  1074: { name: 'System Shutdown or Restart Initiated', level: 'Information' },
-  6005: { name: 'The Event Log Service was Started', level: 'Information' },
-  6006: { name: 'The Event Log Service was Stopped', level: 'Warning' }
-};
+// Helper to extract UTF-16LE and ASCII paths from binary buffers (for LNK, JumpLists, Shellbags)
+function extractPathsFromBinary(buf: Buffer, maxPaths = 25): Array<{ path: string; offset: number }> {
+  const paths: Array<{ path: string; offset: number }> = [];
+  const seen = new Set<string>();
+
+  // 1. Scan UTF-16LE string representations
+  const utf16 = buf.toString('utf16le');
+  const pathRegex = /([a-zA-Z]:\\[a-zA-Z0-9_\-.\s\\]+\.(exe|docx|xlsx|pptx|pdf|zip|rar|ps1|bat|vbs|txt|lnk))/gi;
+  let match;
+  while ((match = pathRegex.exec(utf16)) !== null && paths.length < maxPaths) {
+    const p = match[1].trim();
+    if (p.length > 8 && !seen.has(p.toLowerCase())) {
+      seen.add(p.toLowerCase());
+      paths.push({ path: p, offset: match.index * 2 });
+    }
+  }
+
+  // 2. Scan Latin-1 representation for standard ASCII paths
+  const latin1 = buf.toString('latin1');
+  let matchAscii;
+  while ((matchAscii = pathRegex.exec(latin1)) !== null && paths.length < maxPaths) {
+    const p = matchAscii[1].trim();
+    if (p.length > 8 && !seen.has(p.toLowerCase())) {
+      seen.add(p.toLowerCase());
+      paths.push({ path: p, offset: matchAscii.index });
+    }
+  }
+
+  return paths;
+}
 
 // Local forensic analyzer that processes uploaded files against selected analysis categories
 export async function analyzeArtifactFiles(
@@ -132,170 +147,51 @@ export async function analyzeArtifactFiles(
   const results: ForensicArtifact[] = [];
 
   for (const file of files) {
-    const textContent = await readFileAsText(file);
     const fileNameLower = file.name.toLowerCase();
+
+    // Probe first 16 bytes for magic signatures
+    const headerSlice = await file.slice(0, 16).arrayBuffer();
+    const headerBuf = Buffer.from(headerSlice);
+    const isEvtxMagic =
+      headerBuf.length >= 8 && headerBuf.subarray(0, 8).toString('ascii') === 'ElfFile\0';
+    const isPstMagic =
+      headerBuf.length >= 4 &&
+      headerBuf[0] === 0x21 &&
+      headerBuf[1] === 0x42 &&
+      headerBuf[2] === 0x44 &&
+      headerBuf[3] === 0x4e;
+    const isOleMsgMagic =
+      headerBuf.length >= 8 &&
+      headerBuf[0] === 0xd0 &&
+      headerBuf[1] === 0xcf &&
+      headerBuf[2] === 0x11 &&
+      headerBuf[3] === 0xe0;
+
+    const isEvtxFile = isEvtxMagic || fileNameLower.endsWith('.evtx');
+    const isMailboxFile =
+      isPstMagic ||
+      isOleMsgMagic ||
+      /\.(pst|ost|msg|eml|mbox)$/i.test(fileNameLower);
 
     // ----------------------------------------------------
     // 1. Windows Event Logs Analysis (.evtx, .xml, text logs)
     // ----------------------------------------------------
     if (options.windowsEvents) {
-      // Check for XML Event blocks or line-based event records
-      const eventXmlRegex = /<Event\b[^>]*>([\s\S]*?)<\/Event>/gi;
-      let eventXmlMatch;
-      let xmlEventCount = 0;
-
-      while ((eventXmlMatch = eventXmlRegex.exec(textContent)) !== null && xmlEventCount < 40) {
-        xmlEventCount++;
-        const block = eventXmlMatch[1];
-        
-        // Extract EventID
-        const idMatch = /<EventID(?:\s+Qualifier="[^"]*")?>(\d+)<\/EventID>/i.exec(block);
-        const eventId = idMatch ? parseInt(idMatch[1], 10) : 0;
-        
-        // Extract Provider
-        const provMatch = /<Provider\s+Name="([^"]+)"/i.exec(block);
-        const provider = provMatch ? provMatch[1] : 'Microsoft-Windows-Security-Auditing';
-
-        // Extract Channel
-        const chanMatch = /<Channel>([^<]+)<\/Channel>/i.exec(block);
-        const channel = chanMatch ? chanMatch[1] : 'Security';
-
-        // Extract Level
-        const levelMatch = /<Level>(\d+)<\/Level>/i.exec(block);
-        let levelStr: WindowsEventData['level'] = 'Information';
-        if (levelMatch) {
-          const lNum = parseInt(levelMatch[1], 10);
-          if (lNum === 1) levelStr = 'Critical';
-          else if (lNum === 2) levelStr = 'Error';
-          else if (lNum === 3) levelStr = 'Warning';
+      if (isEvtxFile) {
+        try {
+          const evtxBuffer = await readFileAsArrayBuffer(file, 40 * 1024 * 1024);
+          const evtxArtifacts = await parseEvtxBinary(evtxBuffer, file.name, file.lastModified);
+          results.push(...evtxArtifacts);
+        } catch (err) {
+          console.warn(`Error parsing binary EVTX file ${file.name}:`, err);
         }
-
-        // Extract Computer
-        const compMatch = /<Computer>([^<]+)<\/Computer>/i.exec(block);
-        const computer = compMatch ? compMatch[1] : 'INVESTIGATION-HOST';
-
-        // Extract TimeCreated
-        const timeMatch = /<TimeCreated\s+SystemTime="([^"]+)"/i.exec(block);
-        const timestamp = timeMatch ? timeMatch[1].replace('T', ' ').slice(0, 19) + ' UTC' : new Date(file.lastModified).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-
-        // Extract TargetUser or SubjectUser
-        const userMatch = /<Data\s+Name="(?:TargetUserName|SubjectUserName|UserName|User)">([^<]+)<\/Data>/i.exec(block);
-        const user = userMatch ? userMatch[1] : undefined;
-
-        // Extract ProcessName and CommandLine
-        const procMatch = /<Data\s+Name="(?:NewProcessName|ProcessName|Image)">([^<]+)<\/Data>/i.exec(block);
-        const processName = procMatch ? procMatch[1] : undefined;
-        const cmdMatch = /<Data\s+Name="(?:CommandLine|ScriptBlockText)">([^<]+)<\/Data>/i.exec(block);
-        const commandLine = cmdMatch ? cmdMatch[1] : undefined;
-
-        // Extract IP Address
-        const ipMatch = /<Data\s+Name="(?:IpAddress|WorkstationName)">([^<]+)<\/Data>/i.exec(block);
-        const ipAddress = ipMatch && ipMatch[1] !== '-' ? ipMatch[1] : undefined;
-
-        const knownMeta = KNOWN_EVENT_IDS[eventId];
-        let isSuspicious = Boolean(knownMeta?.suspicious);
-        let suspiciousReason = knownMeta?.reason;
-
-        // Check command line / script block for suspicious actions
-        const targetCmd = (commandLine || '').toLowerCase();
-        if (/powershell.*(-enc|bypass|hidden|iex|downloadstring|base64)/i.test(targetCmd)) {
-          isSuspicious = true;
-          suspiciousReason = 'Obfuscated PowerShell execution detected with bypass/encoded switches';
-        } else if (/mimikatz|certutil.*-urlcache|vssadmin.*delete|whoami.*\/priv|rundll32.*advpack/i.test(targetCmd)) {
-          isSuspicious = true;
-          suspiciousReason = 'Known credential dumping or ransomware defense evasion command line detected';
-        }
-
-        const eventName = knownMeta ? `Event ${eventId}: ${knownMeta.name}` : `Event ${eventId} [${channel}]`;
-        const description = knownMeta ? knownMeta.name : `Windows Event ${eventId} generated by ${provider}`;
-
-        const eventData: WindowsEventData = {
-          eventId,
-          provider,
-          channel,
-          level: isSuspicious ? (eventId === 1102 ? 'Critical' : 'Warning') : levelStr,
-          computer,
-          user,
-          processName,
-          commandLine,
-          ipAddress,
-          description
-        };
-
-        results.push({
-          id: `art-evt-${crypto.randomUUID().slice(0, 8)}`,
-          category: 'windows_events',
-          name: eventName,
-          timestamp,
-          sourceFile: file.name,
-          sourceLocation: `${file.name} > ${channel} Log (Record ID: ${xmlEventCount})`,
-          description,
-          value: commandLine ? `${processName || 'Process'}: ${commandLine.slice(0, 120)}` : user ? `User: ${user} on ${computer}` : `Event ID ${eventId} [${channel}]`,
-          details: {
-            'Event ID': eventId,
-            'Channel / Log': channel,
-            'Provider': provider,
-            'Event Level': eventData.level,
-            'Target Computer': computer,
-            ...(user ? { 'Account User': user } : {}),
-            ...(ipAddress ? { 'Source Network IP': ipAddress } : {}),
-            ...(processName ? { 'Process Path': processName } : {}),
-            ...(commandLine ? { 'Command Line': commandLine.slice(0, 200) } : {})
-          },
-          isSuspicious,
-          suspiciousReason,
-          rawText: block.slice(0, 800),
-          eventData
-        });
       }
 
-      // If no XML tags, search for formatted text event log dumps (e.g. from wevtutil or Event Viewer text exports)
-      if (xmlEventCount === 0) {
-        const textEventRegex = /(?:Event\s*ID|EventId)\s*[:=]\s*(\d+)[\s\S]*?(?=(?:Event\s*ID|EventId)\s*[:=]|\Z)/gi;
-        let textMatch;
-        let textCount = 0;
-        while ((textMatch = textEventRegex.exec(textContent)) !== null && textCount < 25) {
-          textCount++;
-          const snippet = textMatch[0];
-          const eventId = parseInt(textMatch[1], 10);
-          const known = KNOWN_EVENT_IDS[eventId];
-
-          const userMatch = /(?:Account Name|User Name|User)\s*[:=]\s*([^\r\n]+)/i.exec(snippet);
-          const compMatch = /(?:Computer|Computer Name)\s*[:=]\s*([^\r\n]+)/i.exec(snippet);
-          const dateMatch = /(?:Date|Time|Timestamp)\s*[:=]\s*([^\r\n]+)/i.exec(snippet);
-          const isSusp = Boolean(known?.suspicious) || /failed|privilege|unauthorized|bypass/i.test(snippet);
-
-          const eventData: WindowsEventData = {
-            eventId,
-            provider: 'Windows-Event-Audit',
-            channel: 'Security',
-            level: isSusp ? 'Warning' : 'Information',
-            computer: compMatch ? compMatch[1].trim() : 'WORKSTATION-01',
-            user: userMatch ? userMatch[1].trim() : undefined,
-            description: known ? known.name : `Windows Event ID ${eventId}`
-          };
-
-          results.push({
-            id: `art-evt-txt-${crypto.randomUUID().slice(0, 8)}`,
-            category: 'windows_events',
-            name: known ? `Event ${eventId}: ${known.name}` : `Event ID ${eventId}`,
-            timestamp: dateMatch ? dateMatch[1].trim() : new Date(file.lastModified).toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
-            sourceFile: file.name,
-            sourceLocation: `${file.name} > Text Event Stream (Offset: 0x${textMatch.index.toString(16).toUpperCase()})`,
-            description: eventData.description,
-            value: snippet.split('\n').slice(0, 3).map(l => l.trim()).join(' | '),
-            details: {
-              'Event ID': eventId,
-              'Log Type': 'Windows Text Export',
-              'Detected Computer': eventData.computer,
-              ...(eventData.user ? { 'Extracted Account': eventData.user } : {})
-            },
-            isSuspicious: isSusp,
-            suspiciousReason: isSusp ? (known?.reason || 'Security log record flags potential unauthorized state') : undefined,
-            rawText: snippet.slice(0, 600),
-            eventData
-          });
-        }
+      // If not an EVTX or if 0 records were found, test for XML or formatted text exports
+      if (!isEvtxFile || results.filter((r) => r.category === 'windows_events').length === 0) {
+        const textContent = await readFileAsText(file);
+        const textEvtArtifacts = parseEvtxTextOrXml(textContent, file.name, file.lastModified);
+        results.push(...textEvtArtifacts);
       }
     }
 
@@ -303,45 +199,42 @@ export async function analyzeArtifactFiles(
     // 2. Recent Files, LNK Shortcuts, Shellbags, JumpLists
     // ----------------------------------------------------
     if (options.recentFiles) {
-      // A. Scan for LNK target files & Shell link paths (e.g. C:\Users\... or UNC paths)
-      const pathRegex = /([a-zA-Z]:\\[a-zA-Z0-9_\-.\s\\]+\.(exe|docx|xlsx|pptx|pdf|zip|rar|ps1|bat|vbs|txt|lnk))/gi;
+      const isLnk = fileNameLower.endsWith('.lnk');
+      const isJumpList = fileNameLower.includes('destinations-ms');
+      const isShellbag = /shell|bag/i.test(fileNameLower);
+
+      let sourceArtifact: RecentFileData['sourceArtifact'] = 'RecentDocs';
+      if (isLnk) sourceArtifact = 'LNK Shortcut';
+      else if (isJumpList) sourceArtifact = 'JumpList';
+      else if (isShellbag) sourceArtifact = 'Shellbag';
+      else if (/word|excel|powerpnt/i.test(fileNameLower)) sourceArtifact = 'Office Recent';
+
       const seenPaths = new Set<string>();
-      let pathMatch;
-      let pathCount = 0;
 
-      while ((pathMatch = pathRegex.exec(textContent)) !== null && pathCount < 30) {
-        const fullPath = pathMatch[1].trim();
-        const ext = pathMatch[2].toLowerCase();
+      // Extract paths from binary (UTF-16LE and ASCII)
+      const rawSlice = await readFileAsArrayBuffer(file, 4 * 1024 * 1024);
+      const binaryPaths = extractPathsFromBinary(Buffer.from(rawSlice), 30);
 
-        if (fullPath.length > 8 && !seenPaths.has(fullPath.toLowerCase())) {
+      for (const { path: fullPath, offset } of binaryPaths) {
+        if (!seenPaths.has(fullPath.toLowerCase())) {
           seenPaths.add(fullPath.toLowerCase());
-          pathCount++;
-          
           const fileName = fullPath.split('\\').pop() || fullPath;
-          const isLnk = fileNameLower.endsWith('.lnk') || fullPath.endsWith('.lnk');
-          const isJumpList = fileNameLower.includes('destinations-ms');
-          const isShellbag = /shell|bag/i.test(fileNameLower) || /Bags\\/i.test(fullPath);
+          const ext = fileName.includes('.') ? fileName.split('.').pop()!.toLowerCase() : 'EXE';
 
-          let sourceArtifact: RecentFileData['sourceArtifact'] = 'RecentDocs';
-          if (isLnk) sourceArtifact = 'LNK Shortcut';
-          else if (isJumpList) sourceArtifact = 'JumpList';
-          else if (isShellbag) sourceArtifact = 'Shellbag';
-          else if (/word|excel|powerpnt/i.test(fullPath)) sourceArtifact = 'Office Recent';
-
-          // Suspicious indicators:
-          // Executable run from Temp or AppData, double extensions, suspicious script
-          const isSusp = /(temp|appdata|public)\\.*\.exe$/i.test(fullPath) ||
-                         /\.(pdf|doc|docx|xls|xlsx)\.(exe|vbs|ps1|bat)$/i.test(fullPath) ||
-                         /mimikatz|payload|backdoor|stager|nc\.exe|cmd\.exe/i.test(fullPath);
+          const isSusp =
+            /(temp|appdata|public)\\.*\.exe$/i.test(fullPath) ||
+            /\.(pdf|doc|docx|xls|xlsx)\.(exe|vbs|ps1|bat)$/i.test(fullPath) ||
+            /mimikatz|payload|backdoor|stager|nc\.exe|cmd\.exe/i.test(fullPath);
 
           const recentFileData: RecentFileData = {
             fileName,
             filePath: fullPath,
             targetPath: fullPath,
             extension: ext,
+            fileExtension: ext,
             accessTime: new Date(file.lastModified).toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
             sourceArtifact,
-            isSuspicious: isSusp
+            isSuspicious: isSusp,
           };
 
           results.push({
@@ -350,7 +243,7 @@ export async function analyzeArtifactFiles(
             name: `${sourceArtifact}: ${fileName}`,
             timestamp: recentFileData.accessTime,
             sourceFile: file.name,
-            sourceLocation: `${file.name} > ${sourceArtifact} Record`,
+            sourceLocation: `${file.name} > ${sourceArtifact} Record (Offset: 0x${offset.toString(16).toUpperCase()})`,
             description: `Recently accessed file traced via ${sourceArtifact}`,
             value: fullPath,
             details: {
@@ -358,19 +251,20 @@ export async function analyzeArtifactFiles(
               'Full Target Path': fullPath,
               'Extension': ext.toUpperCase(),
               'Carving Source': sourceArtifact,
-              'Evidence File': file.name
+              'Evidence File': file.name,
             },
             isSuspicious: isSusp,
-            suspiciousReason: isSusp 
-              ? 'Target path executes from temporary/unprivileged directories or uses masquerading double extension' 
+            suspiciousReason: isSusp
+              ? 'Target path executes from temporary/unprivileged directories or uses masquerading double extension'
               : undefined,
-            rawText: `Offset 0x${pathMatch.index.toString(16).toUpperCase()}: ${fullPath}`,
-            recentFileData
+            rawText: `Offset 0x${offset.toString(16).toUpperCase()}: ${fullPath}`,
+            recentFileData,
           });
         }
       }
 
-      // B. Shellbag & MRU folder exploration history (e.g. Explorer visited folders)
+      // Shellbag & MRU folder exploration history (e.g. Explorer visited folders)
+      const textContent = await readFileAsText(file);
       const folderPathRegex = /([a-zA-Z]:\\(?:Users|Windows|Program Files|Downloads|Desktop|Documents|AppData)[a-zA-Z0-9_\-\\ ]*)/gi;
       let folderMatch;
       let folderCount = 0;
@@ -385,9 +279,10 @@ export async function analyzeArtifactFiles(
             fileName: folderName,
             filePath: folder,
             extension: 'FOLDER',
+            fileExtension: 'FOLDER',
             accessTime: new Date(file.lastModified).toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
             sourceArtifact: 'Shellbag',
-            isSuspicious: /temp|tor|hidden/i.test(folder)
+            isSuspicious: /temp|tor|hidden/i.test(folder),
           };
 
           results.push({
@@ -402,12 +297,14 @@ export async function analyzeArtifactFiles(
             details: {
               'Folder Name': folderName,
               'Explorer Path': folder,
-              'Artifact Source': 'Windows Shellbag'
+              'Artifact Source': 'Windows Shellbag',
             },
             isSuspicious: recentFileData.isSuspicious ?? false,
-            suspiciousReason: recentFileData.isSuspicious ? 'User explored suspicious staging directory' : undefined,
+            suspiciousReason: recentFileData.isSuspicious
+              ? 'User explored suspicious staging directory'
+              : undefined,
             rawText: folder,
-            recentFileData
+            recentFileData,
           });
         }
       }
@@ -417,208 +314,26 @@ export async function analyzeArtifactFiles(
     // 3. PST / OST / EML / MSG Email Analysis with Outlook Layout
     // ----------------------------------------------------
     if (options.pstEmails) {
-      // Detect whether file is a mailbox (.pst, .ost, .eml, .msg, .mbox) or contains RFC822/message streams
-      const isMailboxFile = /\.(pst|ost|eml|msg|mbox|txt)$/i.test(file.name);
-      
-      // Carve email blocks (headers like From:, To:, Subject:, Date:)
-      const emailBlockRegex = /(?:From:\s*([^\r\n]+)[\s\S]*?(?=From:\s*|\Z))/gi;
-      let emailMatch;
-      let emailCount = 0;
-
-      // Also support standalone RFC822 emails in .eml files
-      const hasEmailHeaders = /From:\s*[^\r\n]+/i.test(textContent) && /Subject:\s*[^\r\n]+/i.test(textContent);
-
-      if (hasEmailHeaders) {
-        while ((emailMatch = emailBlockRegex.exec(textContent)) !== null && emailCount < 30) {
-          const rawBlock = emailMatch[0];
-          emailCount++;
-
-          // Extract From
-          const fromMatch = /From:\s*([^\r\n]+)/i.exec(rawBlock);
-          const rawFrom = fromMatch ? fromMatch[1].trim() : 'unknown@sender.com';
-          const fromNameMatch = /(.*?)(?:<([^>]+)>)?$/i.exec(rawFrom);
-          const fromName = fromNameMatch && fromNameMatch[1]?.trim() ? fromNameMatch[1].replace(/["']/g, '').trim() : rawFrom;
-          const fromEmail = fromNameMatch && fromNameMatch[2] ? fromNameMatch[2].trim() : rawFrom;
-
-          // Extract To
-          const toMatch = /To:\s*([^\r\n]+)/i.exec(rawBlock);
-          const rawTo = toMatch ? toMatch[1].trim() : 'analyst@organization.local';
-          const toList = rawTo.split(/[,;]/).map(t => t.trim()).filter(Boolean);
-
-          // Extract Cc
-          const ccMatch = /Cc:\s*([^\r\n]+)/i.exec(rawBlock);
-          const ccList = ccMatch ? ccMatch[1].split(/[,;]/).map(t => t.trim()).filter(Boolean) : undefined;
-
-          // Extract Subject
-          const subjMatch = /Subject:\s*([^\r\n]+)/i.exec(rawBlock);
-          const subject = subjMatch ? subjMatch[1].trim() : 'No Subject';
-
-          // Extract Date
-          const dateMatch = /Date:\s*([^\r\n]+)/i.exec(rawBlock);
-          let emailDate = new Date(file.lastModified).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-          if (dateMatch) {
-            try {
-              const d = new Date(dateMatch[1].trim());
-              if (!isNaN(d.getTime())) {
-                emailDate = d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-              } else {
-                emailDate = dateMatch[1].trim();
-              }
-            } catch {
-              emailDate = dateMatch[1].trim();
-            }
-          }
-
-          // Extract Message-ID
-          const midMatch = /Message-ID:\s*<([^>]+)>/i.exec(rawBlock);
-          const messageId = midMatch ? midMatch[1] : `<msg-${crypto.randomUUID().slice(0, 12)}@exchange.local>`;
-
-          // Extract Importance
-          const impMatch = /(?:Importance|X-Priority):\s*([^\r\n]+)/i.exec(rawBlock);
-          let importance: ExtractedEmail['importance'] = 'Normal';
-          if (impMatch && /high|1|urgent/i.test(impMatch[1])) {
-            importance = 'High';
-          }
-
-          // Extract Attachments
-          const attachmentRegex = /(?:filename|name)=["']?([^"';\r\n]+\.(?:exe|iso|zip|pdf|docx|xlsx|pptx|scr|vbs|js|bat|png|jpg))["']?/gi;
-          const attachments: ExtractedEmail['attachments'] = [];
-          let attMatch;
-          while ((attMatch = attachmentRegex.exec(rawBlock)) !== null) {
-            const attName = attMatch[1];
-            const isSuspAtt = /\.(exe|iso|scr|vbs|js|bat|zip)$/i.test(attName);
-            attachments.push({
-              name: attName,
-              size: Math.floor(Math.random() * 450000) + 12000,
-              type: attName.split('.').pop()?.toUpperCase() || 'BIN',
-              isSuspicious: isSuspAtt
-            });
-          }
-
-          // Extract Body Text (text after empty newline or headers)
-          const bodySplit = rawBlock.split(/\r?\n\r?\n/);
-          let bodyText = bodySplit.slice(1).join('\n\n').trim();
-          if (!bodyText || bodyText.length < 5) {
-            bodyText = `Extracted email communication regarding "${subject}". Original message body archived in PST/OST evidence store.`;
-          }
-
-          // Phishing / Threat analysis
-          const combinedLower = (subject + ' ' + bodyText + ' ' + rawFrom).toLowerCase();
-          const hasPhishingKeywords = /urgent|wire transfer|overdue payment|account suspended|verify your password|invoice attached|cryptocurrency|gift card|click here to verify|security alert|action required/i.test(combinedLower);
-          const hasSuspiciousAtt = attachments.some(a => a.isSuspicious);
-
-          const isPhishing = hasPhishingKeywords || hasSuspiciousAtt;
-          let phishingReason: string | undefined;
-          if (hasSuspiciousAtt && hasPhishingKeywords) {
-            phishingReason = 'High-Risk Phishing: Combines urgent financial/coercive language with high-risk attachment payload (.exe, .iso, .scr, or script)';
-          } else if (hasSuspiciousAtt) {
-            phishingReason = 'Malicious Payload Flag: Contains potentially executable or script attachment in email transmission';
-          } else if (hasPhishingKeywords) {
-            phishingReason = 'Social Engineering Indicator: Email contains classic phishing coercion or credential harvesting terminology';
-          }
-
-          // Assign folder based on flags / sender
-          let folder: ExtractedEmail['folder'] = 'Inbox';
-          if (isPhishing) {
-            folder = 'Junk';
-          } else if (/sent|outbox/i.test(rawBlock) || rawFrom.includes('user') || rawFrom.includes('investigation')) {
-            folder = 'Sent Items';
-          }
-
-          const extractedEmail: ExtractedEmail = {
-            id: `msg-${crypto.randomUUID().slice(0, 8)}`,
-            from: fromEmail,
-            fromName,
-            to: toList,
-            cc: ccList,
-            subject,
-            date: emailDate,
-            bodyText: bodyText.slice(0, 3000),
-            folder,
-            hasAttachments: attachments.length > 0,
-            attachments: attachments.length > 0 ? attachments : undefined,
-            messageId,
-            importance,
-            isPhishing,
-            phishingReason,
-            rawMime: rawBlock.slice(0, 2000)
-          };
-
-          results.push({
-            id: `art-mail-${crypto.randomUUID().slice(0, 8)}`,
-            category: 'emails',
-            name: `Email: ${subject}`,
-            timestamp: emailDate,
-            sourceFile: file.name,
-            sourceLocation: `${file.name} > ${folder} > ${fromName || fromEmail}`,
-            description: `Outlook PST/OST extracted email message from ${fromName} (${fromEmail})`,
-            value: `Subject: ${subject} | From: ${fromEmail}`,
-            details: {
-              'From': `${fromName} <${fromEmail}>`,
-              'To': toList.join(', '),
-              ...(ccList ? { 'Cc': ccList.join(', ') } : {}),
-              'Subject': subject,
-              'Date': emailDate,
-              'Folder': folder,
-              'Attachments Count': attachments.length,
-              'Importance': importance,
-              'Message-ID': messageId
-            },
-            isSuspicious: isPhishing,
-            suspiciousReason: phishingReason,
-            rawText: rawBlock.slice(0, 1500),
-            emailData: extractedEmail
-          });
-        }
-      } else if (isMailboxFile) {
-        // If it's a binary PST/OST file, carve strings matching email patterns (From, Subject, etc.)
-        const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
-        const seenMails = new Set<string>();
-        let mMatch;
-        let mCount = 0;
-        while ((mMatch = emailRegex.exec(textContent)) !== null && mCount < 15) {
-          const foundEmail = mMatch[0];
-          if (!seenMails.has(foundEmail.toLowerCase())) {
-            seenMails.add(foundEmail.toLowerCase());
-            mCount++;
-
-            const isSusp = /temp|onion|attacker|c2|payload|phish/i.test(foundEmail);
-            const extractedEmail: ExtractedEmail = {
-              id: `msg-bin-${crypto.randomUUID().slice(0, 8)}`,
-              from: foundEmail,
-              to: ['investigation-user@internal.local'],
-              subject: `Carved PST Message Record #${mCount}`,
-              date: new Date(file.lastModified).toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
-              bodyText: `Extracted email entity discovered in binary mailbox container (${file.name}). Stream address: ${foundEmail}`,
-              folder: isSusp ? 'Junk' : 'Inbox',
-              hasAttachments: false,
-              isPhishing: isSusp,
-              phishingReason: isSusp ? 'Suspicious address carved from mailbox database' : undefined
-            };
-
-            results.push({
-              id: `art-pst-${crypto.randomUUID().slice(0, 8)}`,
-              category: 'emails',
-              name: `PST Carved Message (${foundEmail})`,
-              timestamp: extractedEmail.date,
-              sourceFile: file.name,
-              sourceLocation: `${file.name} > Carved NID Table`,
-              description: `Extracted Outlook mailbox communication record`,
-              value: `Carved Email Address: ${foundEmail}`,
-              details: {
-                'Discovered Address': foundEmail,
-                'Source Container': file.name,
-                'File Offset': `0x${mMatch.index.toString(16).toUpperCase()}`
-              },
-              isSuspicious: isSusp,
-              suspiciousReason: extractedEmail.phishingReason,
-              rawText: `Offset 0x${mMatch.index.toString(16).toUpperCase()}: ${foundEmail}`,
-              emailData: extractedEmail
-            });
-          }
+      if (isMailboxFile) {
+        try {
+          const mailBuffer = await readFileAsArrayBuffer(file, 64 * 1024 * 1024);
+          const mailArtifacts = await parsePstOrMailboxBinary(mailBuffer, file.name, file.lastModified);
+          results.push(...mailArtifacts);
+        } catch (err) {
+          console.warn(`Error parsing binary mailbox file ${file.name}:`, err);
         }
       }
+
+      // If not recognized as binary mailbox or if 0 emails were carved, test for RFC822 / text email headers
+      if (!isMailboxFile || results.filter((r) => r.category === 'emails').length === 0) {
+        const textContent = await readFileAsText(file);
+        const emlArtifacts = parseEmailTextOrMime(textContent, file.name, file.lastModified);
+        results.push(...emlArtifacts);
+      }
     }
+
+    // Read textContent for remaining textual / artifact parsers
+    const textContent = await readFileAsText(file);
 
     // ----------------------------------------------------
     // 4. Browser History Analysis

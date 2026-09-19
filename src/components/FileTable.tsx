@@ -14,8 +14,8 @@ interface FileTableProps {
   onSelectFile: (id: string) => void;
 }
 
-export default function FileTable({ files, selectedFileId, onSelectFile }: FileTableProps) {
-  if (files.length === 0) {
+export default function FileTable({ files = [], selectedFileId, onSelectFile }: FileTableProps) {
+  if (!files || files.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-zinc-700 bg-zinc-950/50">
         <FileWarning className="w-12 h-12 mb-2 opacity-5" />
@@ -40,7 +40,7 @@ export default function FileTable({ files, selectedFileId, onSelectFile }: FileT
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-900/50">
-            {files.map((file, index) => (
+            {files.filter(Boolean).map((file, index) => (
               <tr 
                 key={file.id} 
                 onClick={() => onSelectFile(file.id)}

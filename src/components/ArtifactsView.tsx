@@ -75,24 +75,32 @@ export default function ArtifactsView({
       // Search query match
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
-        const inName = art.name.toLowerCase().includes(q);
-        const inVal = art.value.toLowerCase().includes(q);
-        const inSrc = art.sourceFile.toLowerCase().includes(q) || art.sourceLocation.toLowerCase().includes(q);
-        const inDesc = art.description.toLowerCase().includes(q);
-        const inDetails = Object.entries(art.details).some(
-          ([k, v]) => k.toLowerCase().includes(q) || String(v).toLowerCase().includes(q)
-        );
+        const inName = (art.name || '').toLowerCase().includes(q);
+        const inVal = (art.value || '').toLowerCase().includes(q);
+        const inSrc = ((art.sourceFile || '') + ' ' + (art.sourceLocation || '')).toLowerCase().includes(q);
+        const inDesc = (art.description || '').toLowerCase().includes(q);
+        const inDetails = art.details
+          ? Object.entries(art.details).some(
+              ([k, v]) => k.toLowerCase().includes(q) || String(v).toLowerCase().includes(q)
+            )
+          : false;
         if (!inName && !inVal && !inSrc && !inDesc && !inDetails) return false;
       }
       return true;
     }).sort((a, b) => {
       let cmp = 0;
+      const aTime = a.timestamp || '';
+      const bTime = b.timestamp || '';
+      const aName = a.name || '';
+      const bName = b.name || '';
+      const aCat = a.category || '';
+      const bCat = b.category || '';
       if (sortField === 'timestamp') {
-        cmp = a.timestamp.localeCompare(b.timestamp);
+        cmp = aTime.localeCompare(bTime);
       } else if (sortField === 'name') {
-        cmp = a.name.localeCompare(b.name);
+        cmp = aName.localeCompare(bName);
       } else {
-        cmp = a.category.localeCompare(b.category);
+        cmp = aCat.localeCompare(bCat);
       }
       return sortAsc ? cmp : -cmp;
     });
@@ -536,9 +544,9 @@ export default function ArtifactsView({
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-blue-950 text-blue-300 border border-blue-800">
-                              {selectedArtifact.emailData.mailboxSource}
+                              {(selectedArtifact.emailData as any).mailboxSource || selectedArtifact.sourceFile || 'PST Mailbox'}
                             </span>
-                            <span className="text-xs font-bold text-zinc-200 truncate max-w-md">{selectedArtifact.emailData.subject}</span>
+                            <span className="text-xs font-bold text-zinc-200 truncate max-w-md">{selectedArtifact.emailData.subject || 'Extracted Message'}</span>
                           </div>
                           <button
                             onClick={() => {
@@ -554,14 +562,16 @@ export default function ArtifactsView({
                         <div className="grid grid-cols-2 gap-2 text-xs">
                           <div className="p-2 rounded bg-zinc-950 border border-zinc-900">
                             <span className="text-[10px] uppercase font-bold text-zinc-500 block mb-0.5">Sender</span>
-                            <span className="font-mono text-xs text-zinc-300 break-all">{selectedArtifact.emailData.from}</span>
+                            <span className="font-mono text-xs text-zinc-300 break-all">{selectedArtifact.emailData.from || 'Unknown'}</span>
                           </div>
                           <div className="p-2 rounded bg-zinc-950 border border-zinc-900">
                             <span className="text-[10px] uppercase font-bold text-zinc-500 block mb-0.5">Recipient(s)</span>
-                            <span className="font-mono text-xs text-zinc-300 break-all">{selectedArtifact.emailData.to.join(', ')}</span>
+                            <span className="font-mono text-xs text-zinc-300 break-all">
+                              {Array.isArray(selectedArtifact.emailData.to) ? selectedArtifact.emailData.to.join(', ') : (selectedArtifact.emailData.to || 'None')}
+                            </span>
                           </div>
                         </div>
-                        {selectedArtifact.emailData.attachments.length > 0 && (
+                        {selectedArtifact.emailData.attachments && selectedArtifact.emailData.attachments.length > 0 && (
                           <div className="p-2 rounded bg-zinc-950 border border-zinc-900 space-y-1">
                             <span className="text-[10px] uppercase font-bold text-zinc-500 block">
                               Extracted Attachments ({selectedArtifact.emailData.attachments.length})
@@ -573,7 +583,7 @@ export default function ArtifactsView({
                                     ? 'bg-red-950/80 text-red-300 border-red-800' 
                                     : 'bg-zinc-900 text-zinc-300 border-zinc-800'
                                 }`}>
-                                  {att.filename} ({att.size})
+                                  {att.name || (att as any).filename || 'File'} ({att.size ? `${Math.round(att.size / 1024)} KB` : 'Payload'})
                                 </span>
                               ))}
                             </div>
@@ -626,10 +636,10 @@ export default function ArtifactsView({
                     {/* Extracted Key-Value Properties */}
                     <div>
                       <h4 className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 mb-2 font-sans">
-                        Structured Metadata Fields ({Object.keys(selectedArtifact.details).length})
+                        Structured Metadata Fields ({Object.keys(selectedArtifact.details || {}).length})
                       </h4>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-2 font-mono text-xs">
-                        {Object.entries(selectedArtifact.details).map(([key, val]) => (
+                        {Object.entries(selectedArtifact.details || {}).map(([key, val]) => (
                           <div 
                             key={key} 
                             className="flex items-baseline justify-between p-2 rounded bg-zinc-900/30 border border-zinc-900"

@@ -78,6 +78,21 @@ export default function App() {
         currentPath = currentPath ? `${currentPath}/${part}` : part;
 
         if (isFile) {
+          const resolvedParent = parentPath || 'Evidence';
+          if (!parentPath) {
+            if (!newFoldersMap[resolvedParent]) {
+              newFoldersMap[resolvedParent] = {
+                id: resolvedParent,
+                name: 'Evidence Files',
+                path: resolvedParent,
+                children: [],
+                fileIds: []
+              };
+            }
+            if (!newRootPaths.includes(resolvedParent)) {
+              newRootPaths.push(resolvedParent);
+            }
+          }
           newFilesMap[id] = {
             id,
             file,
@@ -88,10 +103,10 @@ export default function App() {
             status: 'pending',
             extensionMismatch: false,
             path: relativePath,
-            parentPath
+            parentPath: resolvedParent
           };
-          if (newFoldersMap[parentPath]) {
-            newFoldersMap[parentPath].fileIds.push(id);
+          if (newFoldersMap[resolvedParent]) {
+            newFoldersMap[resolvedParent].fileIds.push(id);
           }
         } else {
           if (!newFoldersMap[currentPath]) {
@@ -173,8 +188,10 @@ export default function App() {
   }, [files]);
 
   // Derived data
-  const currentFolder = folders[selectedFolderId];
-  const filesInView = currentFolder ? currentFolder.fileIds.map(id => files[id]) : [];
+  const currentFolder = selectedFolderId ? folders[selectedFolderId] : null;
+  const filesInView = currentFolder && currentFolder.fileIds 
+    ? currentFolder.fileIds.map(id => files[id]).filter(Boolean) 
+    : [];
   const selectedFile = selectedFileId ? files[selectedFileId] : null;
 
   return (
@@ -329,7 +346,7 @@ export default function App() {
                     <HardDrive className="w-3 h-3" />
                     <span>C:</span>
                   </div>
-                  {selectedFolderId.split('/').map((part, i) => (
+                  {(selectedFolderId || '').split('/').filter(Boolean).map((part, i) => (
                     <React.Fragment key={i}>
                       <ChevronRight className="w-3 h-3 text-zinc-700" />
                       <span>{part}</span>
