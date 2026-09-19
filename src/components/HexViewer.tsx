@@ -37,9 +37,9 @@ export default function HexViewer({ file }: HexViewerProps) {
     loadData();
   }, [file, offset, pageSize]);
 
-  const rows = useMemo(() => {
+  const rows = useMemo<Uint8Array[]>(() => {
     if (!data) return [];
-    const result = [];
+    const result: Uint8Array[] = [];
     for (let i = 0; i < data.length; i += 16) {
       result.push(data.slice(i, i + 16));
     }
@@ -94,8 +94,8 @@ export default function HexViewer({ file }: HexViewerProps) {
             <tbody>
               {rows.map((row, rowIndex) => {
                 const rowOffset = (offset + rowIndex * 16).toString(16).toUpperCase().padStart(8, '0');
-                const hexValues = Array.from(row).map(b => b.toString(16).padStart(2, '0').toUpperCase());
-                const asciiValues = Array.from(row).map(b => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.'));
+                const hexValues = Array.from(row).map((b: number) => b.toString(16).padStart(2, '0').toUpperCase());
+                const asciiValues = Array.from(row).map((b: number) => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.'));
 
                 return (
                   <tr key={rowIndex} className="hover:bg-zinc-900 group">
