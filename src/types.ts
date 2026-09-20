@@ -46,6 +46,7 @@ export interface ExtractedEmailAttachment {
   size: number;
   type?: string;
   isSuspicious?: boolean;
+  suspiciousReason?: string;
 }
 
 export interface ExtractedEmail {

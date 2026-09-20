@@ -4,6 +4,7 @@
  */
 
 import { Buffer } from 'buffer';
+import { PSTFile, PSTFolder, PSTMessage } from 'pst-extractor';
 import { ForensicArtifact, ExtractedEmail, ExtractedEmailAttachment } from '../types';
 
 /**
@@ -30,6 +31,7 @@ export const PST_COMP_ENC: number[] = [
 ];
 
 function formatIsoUtc(date: Date): string {
+  if (isNaN(date.getTime())) return 'Unknown UTC';
   return date.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
 
@@ -39,13 +41,27 @@ function formatIsoUtc(date: Date): string {
 export function decodePstCompressibleBuffer(data: Buffer): Buffer {
   const result = Buffer.alloc(data.length);
   for (let i = 0; i < data.length; i++) {
-    result[i] = PST_COMP_ENC[data[i] & 0xff];
+    result[i] = PST_COMP_ENC[data[i]];
   }
   return result;
 }
 
 /**
- * Parses binary PST/OST, MSG, or EML files
+ * Normalizes folder path to Outlook folder name
+ */
+function normalizeFolderName(folderName: string, path: string): ExtractedEmail['folder'] {
+  const combined = (folderName + ' ' + path).toLowerCase();
+  if (combined.includes('inbox')) return 'Inbox';
+  if (combined.includes('sent')) return 'Sent Items';
+  if (combined.includes('draft')) return 'Drafts';
+  if (combined.includes('junk') || combined.includes('spam')) return 'Junk';
+  if (combined.includes('delete') || combined.includes('trash')) return 'Deleted Items';
+  if (combined.includes('archive')) return 'Archive';
+  return 'Inbox';
+}
+
+/**
+ * Extracts and parses email messages from PST/OST/MSG/EML binary data.
  */
 export async function parsePstOrMailboxBinary(
   arrayBuffer: ArrayBuffer,
@@ -54,6 +70,7 @@ export async function parsePstOrMailboxBinary(
 ): Promise<ForensicArtifact[]> {
   const buf = Buffer.from(arrayBuffer);
   const results: ForensicArtifact[] = [];
+  const seenFingerprints = new Set<string>();
 
   // 1. Check for PST / OST Magic: !BDN (0x21 0x42 0x44 0x4E)
   const isPstMagic =
@@ -75,52 +92,78 @@ export async function parsePstOrMailboxBinary(
     buf[6] === 0x1a &&
     buf[7] === 0xe1;
 
-  if (isPstMagic) {
-    // Read header details
-    // Offset 0x0A (10): wVer (14/15 ANSI, 23 Unicode, 36 2013 Unicode)
-    const wVer = buf.length > 12 ? buf.readUInt16LE(10) : 23;
-    // Offset 0x1CD (461): bCryptMethod (0 = none, 1 = compressible permutation, 2 = cyclic)
-    const bCryptMethod = buf.length > 462 ? buf[461] : 1;
+  const isPstExtension = /\.(pst|ost)$/i.test(fileName);
 
-    // Decrypt data region if compressible encryption is active
-    let processBuffer = buf;
-    if (bCryptMethod === 1) {
-      // Decode data portion (starting after 512-byte header)
-      const headerPart = buf.subarray(0, 512);
-      const dataPart = buf.subarray(512);
-      const decodedData = decodePstCompressibleBuffer(dataPart);
-      processBuffer = Buffer.concat([headerPart, decodedData]);
+  if (isPstMagic || isPstExtension) {
+    // Attempt object-oriented PST traversal using pst-extractor
+    try {
+      const pstFile = new PSTFile(buf);
+      const rootFolder = pstFile.getRootFolder();
+      if (rootFolder) {
+        extractEmailsFromPstFolder(
+          rootFolder,
+          rootFolder.displayName || 'Root',
+          fileName,
+          lastModified,
+          results,
+          seenFingerprints
+        );
+      }
+    } catch (pstErr) {
+      console.warn('PSTFile structural parse error, falling back to deep carver:', pstErr);
     }
 
-    // Carve emails from both decoded data and raw buffer (covers unencrypted headers and decrypted blocks)
-    const extractedMails = carveEmailsFromPstBuffer(
-      processBuffer,
-      fileName,
-      lastModified,
-      wVer,
-      bCryptMethod
-    );
-    results.push(...extractedMails);
-
-    // If no emails found yet, try carving raw buffer as fallback
+    // If structural parsing didn't find emails (e.g. damaged B-tree or partial carve), run deep MAPI/RFC822 carver
     if (results.length === 0) {
-      const rawCarved = carveEmailsFromPstBuffer(buf, fileName, lastModified, wVer, 0);
-      results.push(...rawCarved);
+      const wVer = buf.length > 12 ? buf.readUInt16LE(10) : 23;
+      const bCryptMethod = buf.length > 462 ? buf[461] : 1;
+
+      let processBuffer = buf;
+      if (bCryptMethod === 1 && buf.length > 512) {
+        const headerPart = buf.subarray(0, 512);
+        const dataPart = buf.subarray(512);
+        const decodedData = decodePstCompressibleBuffer(dataPart);
+        processBuffer = Buffer.concat([headerPart, decodedData]);
+      }
+
+      const carved = carveActualEmailsFromBuffer(processBuffer, fileName, lastModified, wVer, bCryptMethod);
+      for (const item of carved) {
+        if (!seenFingerprints.has(item.fingerprint)) {
+          seenFingerprints.add(item.fingerprint);
+          results.push(item.artifact);
+        }
+      }
+
+      // Also try raw buffer if decoded didn't produce results
+      if (results.length === 0) {
+        const rawCarved = carveActualEmailsFromBuffer(buf, fileName, lastModified, wVer, 0);
+        for (const item of rawCarved) {
+          if (!seenFingerprints.has(item.fingerprint)) {
+            seenFingerprints.add(item.fingerprint);
+            results.push(item.artifact);
+          }
+        }
+      }
     }
-  } else if (isOleMsg) {
+  } else if (isOleMsg || fileName.toLowerCase().endsWith('.msg')) {
     // Parse OLE compound document (Outlook MSG)
     const msgResults = carveEmailsFromMsgBuffer(buf, fileName, lastModified);
     results.push(...msgResults);
   } else {
-    // Fallback: Check if it's text-based RFC822 / EML / MBOX format or general binary
+    // Fallback: Check if it's text-based RFC822 / EML / MBOX format
     const text = buf.toString('utf8');
     const emlResults = parseEmailTextOrMime(text, fileName, lastModified);
     results.push(...emlResults);
 
     if (results.length === 0) {
-      // Also try PST carving in case header magic was truncated
-      const carved = carveEmailsFromPstBuffer(buf, fileName, lastModified, 23, 0);
-      results.push(...carved);
+      // Also try deep email carver
+      const carved = carveActualEmailsFromBuffer(buf, fileName, lastModified, 23, 0);
+      for (const item of carved) {
+        if (!seenFingerprints.has(item.fingerprint)) {
+          seenFingerprints.add(item.fingerprint);
+          results.push(item.artifact);
+        }
+      }
     }
   }
 
@@ -135,29 +178,243 @@ export async function parsePstOrMailboxBinary(
 }
 
 /**
- * Carves email items from a decoded PST data buffer
+ * Traverses PST folders recursively and extracts real PSTMessage items
  */
-function carveEmailsFromPstBuffer(
+function extractEmailsFromPstFolder(
+  folder: PSTFolder,
+  currentPath: string,
+  fileName: string,
+  lastModified: number,
+  results: ForensicArtifact[],
+  seenFingerprints: Set<string>,
+  maxEmails = 500
+): void {
+  const queue: Array<{ folder: PSTFolder; path: string }> = [{ folder, path: currentPath }];
+
+  while (queue.length > 0 && results.length < maxEmails) {
+    const { folder: curFolder, path } = queue.shift()!;
+    const folderDisplayName = curFolder.displayName || 'Folder';
+    const folderType = normalizeFolderName(folderDisplayName, path);
+
+    // Read emails from this folder
+    if (curFolder.contentCount > 0) {
+      try {
+        let msg: PSTMessage | null;
+        while ((msg = curFolder.getNextChild()) !== null && results.length < maxEmails) {
+          try {
+            const subject = msg.subject ? msg.subject.trim() : '(No Subject)';
+            const senderName = msg.senderName || msg.sentRepresentingName || 'Unknown Sender';
+            const senderEmail = msg.senderEmailAddress || msg.sentRepresentingEmailAddress || 'unknown@domain.local';
+
+            // Extract recipients
+            const toRecipients: string[] = [];
+            if (msg.displayTo) {
+              toRecipients.push(
+                ...msg.displayTo
+                  .split(/[,;]/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              );
+            }
+            if (toRecipients.length === 0 && msg.numberOfRecipients > 0) {
+              for (let i = 0; i < Math.min(msg.numberOfRecipients, 20); i++) {
+                try {
+                  const recip = msg.getRecipient(i);
+                  if (recip) {
+                    toRecipients.push(recip.emailAddress || recip.displayName || `Recipient #${i + 1}`);
+                  }
+                } catch {
+                  // Skip invalid recipient index
+                }
+              }
+            }
+            if (toRecipients.length === 0) {
+              toRecipients.push('undisclosed-recipients');
+            }
+
+            const ccList = msg.displayCC
+              ? msg.displayCC
+                  .split(/[,;]/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              : undefined;
+
+            const bccList = msg.displayBCC
+              ? msg.displayBCC
+                  .split(/[,;]/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              : undefined;
+
+            // Extract body content
+            let bodyText = msg.body || '';
+            const bodyHtml = msg.bodyHTML || '';
+            if (!bodyText && bodyHtml) {
+              bodyText = bodyHtml
+                .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+                .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            }
+            if (!bodyText && msg.bodyRTF) {
+              bodyText = msg.bodyRTF.replace(/[{}\\\r\n]/g, ' ').replace(/\s+/g, ' ').trim();
+            }
+            if (!bodyText) {
+              bodyText = `Message: "${subject}" [Archived in ${folderDisplayName}]`;
+            }
+
+            // Extract delivery or submission timestamp
+            const dateVal = msg.clientSubmitTime || msg.messageDeliveryTime || msg.creationTime;
+            const emailDate = dateVal ? formatIsoUtc(dateVal) : formatIsoUtc(new Date(lastModified));
+
+            // Attachments
+            const attachments: ExtractedEmailAttachment[] = [];
+            const numAtt = msg.numberOfAttachments || 0;
+            for (let i = 0; i < numAtt; i++) {
+              try {
+                const att = msg.getAttachment(i);
+                if (att) {
+                  const attName = att.longFilename || att.filename || `attachment_${i + 1}`;
+                  const attSize = att.filesize || att.size || 0;
+                  const attExt = attName.split('.').pop()?.toLowerCase() || '';
+                  const isSuspAtt = ['exe', 'bat', 'cmd', 'ps1', 'vbs', 'js', 'scr', 'iso', 'hta', 'vbe', 'wsf', 'dll'].includes(
+                    attExt
+                  );
+
+                  attachments.push({
+                    name: attName,
+                    size: attSize,
+                    type: attExt.toUpperCase() || 'BIN',
+                    isSuspicious: isSuspAtt,
+                    suspiciousReason: isSuspAtt
+                      ? `Potentially executable or script attachment extension (.${attExt})`
+                      : undefined,
+                  });
+                }
+              } catch {
+                // Ignore attachment read issue
+              }
+            }
+
+            // Threat / Phishing analysis
+            const hasSuspAttachment = attachments.some((a) => a.isSuspicious);
+            const lowerText = (subject + ' ' + bodyText + ' ' + senderEmail).toLowerCase();
+            const hasUrgentFinancialKeyword =
+              /wire transfer|urgent payment|account suspended|verify credentials|invoice attached|cryptocurrency|gift card|security alert|password reset|immediate action/i.test(
+                lowerText
+              );
+
+            const isPhishing = hasSuspAttachment || hasUrgentFinancialKeyword;
+            let phishingReason: string | undefined;
+            if (hasSuspAttachment && hasUrgentFinancialKeyword) {
+              phishingReason =
+                'High-Risk Phishing: Contains urgent financial coercion and dangerous attachment payload';
+            } else if (hasSuspAttachment) {
+              phishingReason = 'Suspicious Attachment: Contains potentially executable script or disk image file';
+            } else if (hasUrgentFinancialKeyword) {
+              phishingReason = 'Social Engineering Indicator: Urgent coercive financial/credential terminology detected';
+            }
+
+            // Deduplication fingerprint
+            const fingerprint = `${senderEmail}:${subject}:${emailDate}`.toLowerCase();
+            if (seenFingerprints.has(fingerprint)) continue;
+            seenFingerprints.add(fingerprint);
+
+            const emailData: ExtractedEmail = {
+              id: `msg-pst-${results.length + 1}-${crypto.randomUUID().slice(0, 6)}`,
+              from: senderEmail,
+              fromName: senderName,
+              to: toRecipients,
+              cc: ccList,
+              bcc: bccList,
+              subject,
+              date: emailDate,
+              bodyText: bodyText.slice(0, 8000),
+              bodyHtml: bodyHtml || undefined,
+              folder: folderType,
+              hasAttachments: attachments.length > 0,
+              attachments: attachments.length > 0 ? attachments : undefined,
+              importance: msg.importance === 2 ? 'High' : msg.importance === 0 ? 'Low' : 'Normal',
+              isPhishing,
+              phishingReason,
+              read: msg.isRead ?? true,
+            };
+
+            results.push({
+              id: `art-pst-mail-${results.length + 1}-${crypto.randomUUID().slice(0, 6)}`,
+              category: 'emails',
+              name: `Email: ${subject}`,
+              timestamp: emailDate,
+              sourceFile: fileName,
+              sourceLocation: `${fileName} > ${path} > ${subject.slice(0, 40)}`,
+              description: `Outlook PST message from ${senderName} <${senderEmail}>`,
+              value: `Subject: ${subject} | From: ${senderEmail}`,
+              details: {
+                'From': `${senderName} <${senderEmail}>`,
+                'To': toRecipients.join(', '),
+                ...(ccList && ccList.length > 0 ? { 'Cc': ccList.join(', ') } : {}),
+                'Subject': subject,
+                'Date': emailDate,
+                'Folder': folderType,
+                'Attachments':
+                  attachments.length > 0
+                    ? attachments.map((a) => `${a.name} (${a.size} bytes)`).join(', ')
+                    : 'None',
+                'Status': msg.isRead ? 'Read' : 'Unread',
+              },
+              isSuspicious: isPhishing,
+              suspiciousReason: phishingReason,
+              rawText: `From: ${senderName} <${senderEmail}>\nTo: ${toRecipients.join(', ')}\nSubject: ${subject}\nDate: ${emailDate}\n\n${bodyText.slice(
+                0,
+                2000
+              )}`,
+              emailData,
+            });
+          } catch (msgErr) {
+            console.warn('Error extracting individual PSTMessage:', msgErr);
+          }
+        }
+      } catch (childErr) {
+        console.warn(`Error reading folder children in ${folderDisplayName}:`, childErr);
+      }
+    }
+
+    // Traverse subfolders
+    if (curFolder.hasSubfolders) {
+      try {
+        const subs = curFolder.getSubFolders();
+        for (const sub of subs) {
+          queue.push({ folder: sub, path: `${path}/${sub.displayName || 'Subfolder'}` });
+        }
+      } catch (subErr) {
+        console.warn(`Error querying subfolders of ${folderDisplayName}:`, subErr);
+      }
+    }
+  }
+}
+
+/**
+ * Carves actual emails from raw or decrypted buffers without dummy placeholder creation
+ */
+function carveActualEmailsFromBuffer(
   buf: Buffer,
   fileName: string,
   lastModified: number,
   pstVersion: number,
   cryptMethod: number
-): ForensicArtifact[] {
-  const results: ForensicArtifact[] = [];
-  const maxEmails = 50;
-  const seenFingerprints = new Set<string>();
+): Array<{ fingerprint: string; artifact: ForensicArtifact }> {
+  const items: Array<{ fingerprint: string; artifact: ForensicArtifact }> = [];
+  const textAscii = buf.toString('latin1');
+  const maxEmails = 60;
 
   // 1. Scan for RFC822 Internet Header streams (PR_TRANSPORT_MESSAGE_HEADERS)
-  // In PST files, full email headers start with Received:, From:, or Return-Path:
   const headerMarkerRegex = /(?:(?:Received|Return-Path|From|Message-ID):\s*([^\r\n]+)[\r\n]+){2,}/gi;
-  const textAscii = buf.toString('latin1');
   let headerMatch;
 
-  while ((headerMatch = headerMarkerRegex.exec(textAscii)) !== null && results.length < maxEmails) {
+  while ((headerMatch = headerMarkerRegex.exec(textAscii)) !== null && items.length < maxEmails) {
     const startIndex = headerMatch.index;
-    // Capture up to 8KB of email header and body block
-    const blockEnd = Math.min(startIndex + 12000, textAscii.length);
+    const blockEnd = Math.min(startIndex + 16000, textAscii.length);
     const candidateText = textAscii.slice(startIndex, blockEnd);
 
     const parsed = parseSingleEmailStream(
@@ -165,96 +422,28 @@ function carveEmailsFromPstBuffer(
       fileName,
       `PST Stream 0x${startIndex.toString(16).toUpperCase()}`,
       lastModified,
-      results.length + 1
+      items.length + 1
     );
 
-    if (parsed && !seenFingerprints.has(parsed.fingerprint)) {
-      seenFingerprints.add(parsed.fingerprint);
-      results.push(parsed.artifact);
+    if (parsed) {
+      items.push(parsed);
     }
   }
 
-  // 2. Scan for UTF-16LE MAPI property blocks (common in Unicode PST files)
-  // Unicode PST files store Subject, From, Body as UTF-16LE
-  if (results.length < 15) {
-    const utf16Emails = carveUtf16MapiEmails(buf, fileName, lastModified, results.length);
+  // 2. Scan for UTF-16LE MAPI property blocks
+  if (items.length < 20) {
+    const utf16Emails = carveUtf16MapiEmails(buf, fileName, lastModified, items.length);
     for (const item of utf16Emails) {
-      if (results.length >= maxEmails) break;
-      if (!seenFingerprints.has(item.fingerprint)) {
-        seenFingerprints.add(item.fingerprint);
-        results.push(item.artifact);
-      }
+      if (items.length >= maxEmails) break;
+      items.push(item);
     }
   }
 
-  // 3. Fallback: If still no emails discovered, carve raw email addresses and message fragments
-  if (results.length === 0) {
-    const emailAddrRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
-    const discoveredAddresses = new Set<string>();
-    let addrMatch;
-    let count = 0;
-
-    while ((addrMatch = emailAddrRegex.exec(textAscii)) !== null && count < 20) {
-      const addr = addrMatch[1];
-      const lower = addr.toLowerCase();
-      // Skip file extension false positives
-      if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.dll')) continue;
-
-      if (!discoveredAddresses.has(lower)) {
-        discoveredAddresses.add(lower);
-        count++;
-
-        const isSusp = /attacker|c2|payload|phish|malware|drop|exfil|urgent/i.test(lower);
-        const emailDate = formatIsoUtc(new Date(lastModified));
-        const emailData: ExtractedEmail = {
-          id: `msg-pst-${count}-${crypto.randomUUID().slice(0, 6)}`,
-          from: addr,
-          fromName: addr.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
-          to: ['analyst@opencase.forensics'],
-          subject: `Discovered Mailbox Entity #${count} [${addr.split('@')[1]}]`,
-          date: emailDate,
-          bodyText: `Extracted mailbox entity identified in PST/OST evidence store (${fileName}). Verified crypt method: ${
-            cryptMethod === 1 ? 'Compressible Permutation' : 'Standard'
-          }. Stream Address: ${addr}`,
-          folder: isSusp ? 'Junk' : 'Inbox',
-          hasAttachments: false,
-          isPhishing: isSusp,
-          phishingReason: isSusp ? 'Suspicious domain or email identity recovered from PST table stream' : undefined,
-          read: true,
-        };
-
-        results.push({
-          id: `art-pst-mail-${count}-${crypto.randomUUID().slice(0, 6)}`,
-          category: 'emails',
-          name: `Email: ${emailData.subject}`,
-          timestamp: emailDate,
-          sourceFile: fileName,
-          sourceLocation: `${fileName} > PST Table Block #${count} (Offset: 0x${addrMatch.index.toString(16).toUpperCase()})`,
-          description: `Outlook PST/OST extracted message identity for ${addr}`,
-          value: `Subject: ${emailData.subject} | From: ${addr}`,
-          details: {
-            'From': `${emailData.fromName} <${addr}>`,
-            'To': emailData.to.join(', '),
-            'Subject': emailData.subject,
-            'Date': emailDate,
-            'Folder': emailData.folder,
-            'Encryption Type': cryptMethod === 1 ? 'Compressible (Decoded)' : 'None',
-            'PST Version': pstVersion === 23 ? 'Unicode (64-bit)' : 'Standard',
-          },
-          isSuspicious: isSusp,
-          suspiciousReason: emailData.phishingReason,
-          rawText: textAscii.slice(Math.max(0, addrMatch.index - 50), addrMatch.index + 250),
-          emailData,
-        });
-      }
-    }
-  }
-
-  return results;
+  return items;
 }
 
 /**
- * Carves UTF-16LE MAPI property structures from Unicode PST files
+ * Carves UTF-16LE MAPI property blocks
  */
 function carveUtf16MapiEmails(
   buf: Buffer,
@@ -263,23 +452,19 @@ function carveUtf16MapiEmails(
   startIndex: number
 ): Array<{ fingerprint: string; artifact: ForensicArtifact }> {
   const items: Array<{ fingerprint: string; artifact: ForensicArtifact }> = [];
-
-  // Convert buffer to UTF-16LE string
   const utf16String = buf.toString('utf16le');
 
-  // Look for subject patterns or email address patterns in UTF-16LE
-  const subjectRegex = /(?:Subject|RE|FW|Fwd):\s*([^\r\n]{4,80})/gi;
+  const subjectRegex = /(?:Subject|RE|FW|Fwd):\s*([^\r\n]{4,90})/gi;
   let sMatch;
   let count = startIndex;
 
-  while ((sMatch = subjectRegex.exec(utf16String)) !== null && items.length < 15) {
+  while ((sMatch = subjectRegex.exec(utf16String)) !== null && items.length < 20) {
     count++;
     const rawSubject = sMatch[1].trim();
     if (rawSubject.length < 3 || rawSubject.includes('\x00')) continue;
 
-    // Look for nearby sender email or name
-    const windowStart = Math.max(0, sMatch.index - 800);
-    const windowEnd = Math.min(utf16String.length, sMatch.index + 2000);
+    const windowStart = Math.max(0, sMatch.index - 1000);
+    const windowEnd = Math.min(utf16String.length, sMatch.index + 3000);
     const windowText = utf16String.slice(windowStart, windowEnd);
 
     const emailMatch = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i.exec(windowText);
@@ -297,13 +482,12 @@ function carveUtf16MapiEmails(
       }
     }
 
-    // Extract body text from surrounding context
     const bodyLines = windowText
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .filter((l) => l.length > 10 && !l.includes('Subject:') && !l.includes('Date:'));
+      .filter((l) => l.length > 8 && !l.includes('Subject:') && !l.includes('Date:'));
     const bodyText =
-      bodyLines.slice(0, 8).join('\n\n') ||
+      bodyLines.slice(0, 10).join('\n\n') ||
       `Extracted message communication regarding "${rawSubject}". Stream recovered from Unicode PST block.`;
 
     const lowerCombined = (rawSubject + ' ' + bodyText + ' ' + fromEmail).toLowerCase();
@@ -366,7 +550,6 @@ function carveEmailsFromMsgBuffer(
   fileName: string,
   lastModified: number
 ): ForensicArtifact[] {
-  // MSG files contain MAPI streams. Convert buffer to text and scan for MAPI string markers
   const text = buf.toString('latin1');
   const parsed = parseSingleEmailStream(text, fileName, 'MSG Compound File', lastModified, 1);
   return parsed ? [parsed.artifact] : [];
@@ -382,7 +565,6 @@ function parseSingleEmailStream(
   lastModified: number,
   index: number
 ): { fingerprint: string; artifact: ForensicArtifact } | null {
-  // Extract From
   const fromMatch = /From:\s*([^<\r\n]+)?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})?>?/i.exec(
     rawBlock
   );
@@ -398,23 +580,19 @@ function parseSingleEmailStream(
     fromName = fromEmail.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
-  // Extract To
   const toMatch = /To:\s*([^\r\n]+)/i.exec(rawBlock);
   const toList = toMatch
     ? toMatch[1].split(/[,;]/).map((t) => t.trim()).filter(Boolean)
     : ['investigation-team@opencase.local'];
 
-  // Extract CC
   const ccMatch = /Cc:\s*([^\r\n]+)/i.exec(rawBlock);
   const ccList = ccMatch
     ? ccMatch[1].split(/[,;]/).map((t) => t.trim()).filter(Boolean)
     : undefined;
 
-  // Extract Subject
   const subjMatch = /Subject:\s*([^\r\n]+)/i.exec(rawBlock);
   const subject = subjMatch ? subjMatch[1].trim() : 'No Subject';
 
-  // Extract Date
   const dateMatch = /Date:\s*([^\r\n]+)/i.exec(rawBlock);
   let emailDate = formatIsoUtc(new Date(lastModified));
   if (dateMatch) {
@@ -430,18 +608,15 @@ function parseSingleEmailStream(
     }
   }
 
-  // Extract Message-ID
   const midMatch = /Message-ID:\s*<([^>]+)>/i.exec(rawBlock);
   const messageId = midMatch ? midMatch[1] : `<msg-${crypto.randomUUID().slice(0, 12)}@exchange.local>`;
 
-  // Extract Importance
   const impMatch = /(?:Importance|X-Priority):\s*([^\r\n]+)/i.exec(rawBlock);
   let importance: ExtractedEmail['importance'] = 'Normal';
   if (impMatch && /high|1|urgent/i.test(impMatch[1])) {
     importance = 'High';
   }
 
-  // Extract Attachments
   const attachmentRegex = /(?:filename|name)=["']?([^"';\r\n]+\.(?:exe|iso|zip|pdf|docx|xlsx|pptx|scr|vbs|js|bat|png|jpg|rar|7z))["']?/gi;
   const attachments: ExtractedEmailAttachment[] = [];
   let attMatch;
@@ -456,14 +631,12 @@ function parseSingleEmailStream(
     });
   }
 
-  // Extract Body Text
   const bodySplit = rawBlock.split(/\r?\n\r?\n/);
   let bodyText = bodySplit.slice(1).join('\n\n').trim();
   if (!bodyText || bodyText.length < 5) {
     bodyText = `Extracted email communication regarding "${subject}". Original message body archived in PST/OST evidence store.`;
   }
 
-  // Threat & Phishing Analysis
   const combinedLower = (subject + ' ' + bodyText + ' ' + rawFrom).toLowerCase();
   const hasPhishingKeywords = /urgent|wire transfer|overdue payment|account suspended|verify your password|invoice attached|cryptocurrency|gift card|click here to verify|security alert|action required/i.test(
     combinedLower
@@ -483,7 +656,6 @@ function parseSingleEmailStream(
       'Social Engineering Indicator: Email contains classic phishing coercion or credential harvesting terminology';
   }
 
-  // Determine Folder
   let folder: ExtractedEmail['folder'] = 'Inbox';
   if (isPhishing) {
     folder = 'Junk';
@@ -552,10 +724,9 @@ export function parseEmailTextOrMime(
   lastModified: number
 ): ForensicArtifact[] {
   const results: ForensicArtifact[] = [];
-  const maxMails = 40;
+  const maxMails = 60;
   const seenFingerprints = new Set<string>();
 
-  // Split by MIME boundaries or double newline before 'From ' or 'Received:'
   const msgBlocks = textContent.split(/(?=^From\s+[^\r\n]+|^Received:\s+from|^Return-Path:\s*<)/im);
 
   for (let i = 0; i < msgBlocks.length && results.length < maxMails; i++) {
@@ -576,7 +747,6 @@ export function parseEmailTextOrMime(
     }
   }
 
-  // Fallback: If no delimited blocks matched, try parsing whole text as single email
   if (results.length === 0) {
     const parsed = parseSingleEmailStream(
       textContent,

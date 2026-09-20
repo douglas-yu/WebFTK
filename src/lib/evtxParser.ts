@@ -4,7 +4,7 @@
  */
 
 import { Buffer } from 'buffer';
-import { parseEvtxFile } from 'winevtx';
+import { parseEvtxFile, parseEvtxChunk } from 'winevtx';
 import { ForensicArtifact, WindowsEventData } from '../types';
 
 export const KNOWN_EVENT_IDS: Record<
@@ -184,7 +184,222 @@ function analyzeCommandLineThreats(commandLine?: string): {
 }
 
 /**
- * Parses binary EVTX records from ArrayBuffer
+ * Converts a parsed winevtx record object into a ForensicArtifact
+ */
+function convertWinevtxRecordToArtifact(
+  rec: { recordID?: number; timestamp?: number; event: unknown },
+  fileName: string,
+  lastModified: number,
+  index: number
+): { key: string; artifact: ForensicArtifact } | null {
+  const eventObj = (rec.event as Record<string, unknown>) || {};
+  const rootEvent = (eventObj.Event || eventObj) as Record<string, unknown>;
+  const system = (rootEvent.System || {}) as Record<string, unknown>;
+  const eventDataNode = (rootEvent.EventData || rootEvent.UserData || {}) as Record<string, unknown>;
+
+  // Extract EventID
+  const eventId = extractEventId(system.EventID);
+
+  // Extract Provider
+  let provider = 'Microsoft-Windows-Security-Auditing';
+  if (system.Provider) {
+    if (typeof system.Provider === 'string') {
+      provider = system.Provider;
+    } else if (typeof system.Provider === 'object') {
+      const provObj = system.Provider as Record<string, unknown>;
+      provider = extractStringVal(provObj.Name || provObj.name || provObj['#text'] || provider);
+    }
+  }
+
+  // Extract Channel
+  const channel = extractStringVal(system.Channel) || 'Security';
+
+  // Extract Level
+  const rawLevel = system.Level;
+  let level: WindowsEventData['level'] = 'Information';
+  const levelNum = typeof rawLevel === 'number' ? rawLevel : parseInt(String(rawLevel), 10);
+  if (levelNum === 1) level = 'Critical';
+  else if (levelNum === 2) level = 'Error';
+  else if (levelNum === 3) level = 'Warning';
+  else if (levelNum === 4 || levelNum === 0) level = 'Information';
+
+  // Extract Computer
+  const computer = extractStringVal(system.Computer) || 'WINDOWS-HOST';
+
+  // Extract Timestamp
+  let timestamp = formatIsoUtc(new Date(lastModified));
+  if (typeof rec.timestamp === 'number' && !isNaN(rec.timestamp) && rec.timestamp > 0) {
+    timestamp = formatIsoUtc(new Date(rec.timestamp * 1000));
+  } else if (system.TimeCreated) {
+    const timeObj = system.TimeCreated as Record<string, unknown>;
+    const sysTime = extractStringVal(timeObj.SystemTime || timeObj.systemTime);
+    if (sysTime) {
+      try {
+        timestamp = formatIsoUtc(new Date(sysTime));
+      } catch {
+        timestamp = sysTime;
+      }
+    }
+  }
+
+  // Extract Security User SID
+  let userSid: string | undefined;
+  if (system.Security && typeof system.Security === 'object') {
+    const secObj = system.Security as Record<string, unknown>;
+    userSid = extractStringVal(secObj.UserID || secObj.UserId || secObj.user_id) || undefined;
+  }
+
+  // Collect EventData key-value pairs
+  const dataMap: Record<string, string> = {};
+  if (eventDataNode.Data) {
+    const dataVal = eventDataNode.Data;
+    if (Array.isArray(dataVal)) {
+      dataVal.forEach((item, idx) => {
+        if (item && typeof item === 'object') {
+          const itemObj = item as Record<string, unknown>;
+          const name = extractStringVal(itemObj.Name || itemObj.name || `Data_${idx}`);
+          const val = extractStringVal(itemObj.Value || itemObj['#text'] || itemObj.text || item);
+          if (name) dataMap[name] = val;
+        } else {
+          dataMap[`Data_${idx}`] = extractStringVal(item);
+        }
+      });
+    } else if (typeof dataVal === 'object') {
+      for (const [k, v] of Object.entries(dataVal as Record<string, unknown>)) {
+        dataMap[k] = extractStringVal(v);
+      }
+    } else {
+      dataMap['Data'] = extractStringVal(dataVal);
+    }
+  } else {
+    // Flat properties in eventDataNode
+    for (const [k, v] of Object.entries(eventDataNode)) {
+      dataMap[k] = extractStringVal(v);
+    }
+  }
+
+  // Extract user, process, command line, IP from dataMap
+  const user =
+    dataMap.TargetUserName ||
+    dataMap.SubjectUserName ||
+    dataMap.UserName ||
+    dataMap.User ||
+    dataMap.AccountName ||
+    undefined;
+
+  const processPath =
+    dataMap.NewProcessName ||
+    dataMap.ProcessName ||
+    dataMap.Image ||
+    dataMap.Application ||
+    undefined;
+
+  const processName = processPath ? processPath.split('\\').pop() : undefined;
+
+  const commandLine =
+    dataMap.CommandLine ||
+    dataMap.ScriptBlockText ||
+    dataMap.Path ||
+    undefined;
+
+  const ipAddress =
+    dataMap.IpAddress ||
+    dataMap.SourceAddress ||
+    dataMap.WorkstationName ||
+    undefined;
+
+  const taskCategory = extractStringVal(system.Task) || undefined;
+
+  // Metadata lookup
+  const known = KNOWN_EVENT_IDS[eventId];
+  let isSuspicious = Boolean(known?.suspicious);
+  let suspiciousReason = known?.reason;
+
+  // Analyze command line threats
+  const cmdThreat = analyzeCommandLineThreats(commandLine);
+  if (cmdThreat.isSuspicious) {
+    isSuspicious = true;
+    suspiciousReason = cmdThreat.suspiciousReason;
+  }
+
+  if (eventId === 4625) {
+    isSuspicious = true;
+    suspiciousReason = `Failed authentication for account ${user || 'Unknown'} from IP ${ipAddress || 'Host'}`;
+  } else if (eventId === 1102 || eventId === 104) {
+    isSuspicious = true;
+    suspiciousReason = 'CRITICAL: Security/System event log audit clear operation performed';
+  }
+
+  const eventName = known
+    ? `Event ${eventId}: ${known.name}`
+    : `Event ${eventId} [${channel}]`;
+  const description = known
+    ? known.name
+    : `Windows Event Log ID ${eventId} recorded in ${channel}`;
+
+  const recIdNum = typeof rec.recordID === 'number' ? rec.recordID : index;
+
+  const winEventData: WindowsEventData = {
+    eventId,
+    provider,
+    channel,
+    level: isSuspicious ? (eventId === 1102 ? 'Critical' : 'Warning') : level,
+    computer,
+    user,
+    userSid,
+    accountName: user,
+    recordId: recIdNum,
+    processName,
+    processPath,
+    commandLine,
+    ipAddress: ipAddress !== '-' ? ipAddress : undefined,
+    taskCategory,
+    description,
+  };
+
+  const displayValue = commandLine
+    ? `${processName || 'Process'}: ${commandLine.slice(0, 100)}`
+    : user
+    ? `User: ${user} on ${computer}`
+    : `Event ID ${eventId} [${channel}]`;
+
+  const key = `${recIdNum}:${eventId}:${timestamp}`;
+
+  return {
+    key,
+    artifact: {
+      id: `art-evtx-${recIdNum}-${crypto.randomUUID().slice(0, 6)}`,
+      category: 'windows_events',
+      name: eventName,
+      timestamp,
+      sourceFile: fileName,
+      sourceLocation: `${fileName} > Record #${recIdNum} (${channel})`,
+      description,
+      value: displayValue,
+      details: {
+        'Event ID': eventId,
+        'Record ID': recIdNum,
+        'Channel / Log': channel,
+        'Provider': provider,
+        'Event Level': winEventData.level,
+        'Computer Host': computer,
+        ...(user ? { 'Account User': user } : {}),
+        ...(userSid ? { 'User SID': userSid } : {}),
+        ...(ipAddress ? { 'Network Source IP': ipAddress } : {}),
+        ...(processName ? { 'Process Name': processName } : {}),
+        ...(processPath ? { 'Process Path': processPath } : {}),
+        ...(commandLine ? { 'Executed Command Line': commandLine.slice(0, 250) } : {}),
+      },
+      isSuspicious,
+      suspiciousReason,
+      rawText: JSON.stringify(eventObj, null, 2).slice(0, 1500),
+      eventData: winEventData,
+    },
+  };
+}
+
+/**
+ * Parses binary EVTX records from ArrayBuffer across all chunks and records.
  */
 export async function parseEvtxBinary(
   arrayBuffer: ArrayBuffer,
@@ -192,235 +407,224 @@ export async function parseEvtxBinary(
   lastModified: number
 ): Promise<ForensicArtifact[]> {
   const results: ForensicArtifact[] = [];
+  const seenKeys = new Set<string>();
   const buf = Buffer.from(arrayBuffer);
+
+  const maxTotalRecords = 10000;
 
   // If buffer doesn't have standard 4096-byte header or ElfFile\0 magic, attempt carving or XML/text fallback
   if (buf.length < 4096 || buf.subarray(0, 8).toString('ascii') !== 'ElfFile\0') {
-    const carved = carveEvtxRecordsFromBuffer(buf, fileName, lastModified);
+    const carved = carveEvtxRecordsFromBuffer(buf, fileName, lastModified, maxTotalRecords);
     if (carved.length > 0) return carved;
     return parseEvtxTextOrXml(buf.toString('utf-8'), fileName, lastModified);
   }
 
-  let recordCount = 0;
-  const maxRecords = 200; // Return up to 200 records for fast responsiveness
+  const headerBlockSize = buf.length >= 44 ? (buf.readUInt16LE(40) || 4096) : 4096;
 
+  // Step 1: Attempt full-file generator parseEvtxFile
   try {
     const generator = parseEvtxFile(buf);
     for (const rec of generator) {
-      if (recordCount >= maxRecords) break;
-      recordCount++;
-
-      const eventObj = (rec.event as Record<string, unknown>) || {};
-      const rootEvent = (eventObj.Event || eventObj) as Record<string, unknown>;
-      const system = (rootEvent.System || {}) as Record<string, unknown>;
-      const eventDataNode = (rootEvent.EventData ||
-        rootEvent.UserData ||
-        {}) as Record<string, unknown>;
-
-      // Extract EventID
-      const eventId = extractEventId(system.EventID);
-
-      // Extract Provider
-      let provider = 'Microsoft-Windows-Security-Auditing';
-      if (system.Provider) {
-        if (typeof system.Provider === 'string') {
-          provider = system.Provider;
-        } else if (typeof system.Provider === 'object') {
-          const provObj = system.Provider as Record<string, unknown>;
-          provider = extractStringVal(provObj.Name || provObj.name || provObj['#text'] || provider);
+      if (results.length >= maxTotalRecords) break;
+      try {
+        const item = convertWinevtxRecordToArtifact(rec, fileName, lastModified, results.length + 1);
+        if (item && !seenKeys.has(item.key)) {
+          seenKeys.add(item.key);
+          results.push(item.artifact);
         }
+      } catch {
+        // Continue to next record
       }
-
-      // Extract Channel
-      const channel = extractStringVal(system.Channel) || 'Security';
-
-      // Extract Level
-      const rawLevel = system.Level;
-      let level: WindowsEventData['level'] = 'Information';
-      const levelNum = typeof rawLevel === 'number' ? rawLevel : parseInt(String(rawLevel), 10);
-      if (levelNum === 1) level = 'Critical';
-      else if (levelNum === 2) level = 'Error';
-      else if (levelNum === 3) level = 'Warning';
-      else if (levelNum === 4 || levelNum === 0) level = 'Information';
-
-      // Extract Computer
-      const computer = extractStringVal(system.Computer) || 'WINDOWS-HOST';
-
-      // Extract Timestamp
-      let timestamp = formatIsoUtc(new Date(lastModified));
-      if (typeof rec.timestamp === 'number' && !isNaN(rec.timestamp) && rec.timestamp > 0) {
-        timestamp = formatIsoUtc(new Date(rec.timestamp * 1000));
-      } else if (system.TimeCreated) {
-        const timeObj = system.TimeCreated as Record<string, unknown>;
-        const sysTime = extractStringVal(timeObj.SystemTime || timeObj.systemTime);
-        if (sysTime) {
-          try {
-            timestamp = formatIsoUtc(new Date(sysTime));
-          } catch {
-            timestamp = sysTime;
-          }
-        }
-      }
-
-      // Extract Security User SID
-      let userSid: string | undefined;
-      if (system.Security && typeof system.Security === 'object') {
-        const secObj = system.Security as Record<string, unknown>;
-        userSid = extractStringVal(secObj.UserID || secObj.UserId || secObj.user_id) || undefined;
-      }
-
-      // Collect EventData key-value pairs
-      const dataMap: Record<string, string> = {};
-      if (eventDataNode.Data) {
-        const dataVal = eventDataNode.Data;
-        if (Array.isArray(dataVal)) {
-          dataVal.forEach((item, idx) => {
-            if (item && typeof item === 'object') {
-              const itemObj = item as Record<string, unknown>;
-              const name = extractStringVal(itemObj.Name || itemObj.name || `Data_${idx}`);
-              const val = extractStringVal(itemObj.Value || itemObj['#text'] || itemObj.text || item);
-              if (name) dataMap[name] = val;
-            } else {
-              dataMap[`Data_${idx}`] = extractStringVal(item);
-            }
-          });
-        } else if (typeof dataVal === 'object') {
-          for (const [k, v] of Object.entries(dataVal as Record<string, unknown>)) {
-            dataMap[k] = extractStringVal(v);
-          }
-        } else {
-          dataMap['Data'] = extractStringVal(dataVal);
-        }
-      } else {
-        // Flat properties in eventDataNode
-        for (const [k, v] of Object.entries(eventDataNode)) {
-          dataMap[k] = extractStringVal(v);
-        }
-      }
-
-      // Extract user, process, command line, IP from dataMap
-      const user =
-        dataMap.TargetUserName ||
-        dataMap.SubjectUserName ||
-        dataMap.UserName ||
-        dataMap.User ||
-        dataMap.AccountName ||
-        undefined;
-
-      const processPath =
-        dataMap.NewProcessName ||
-        dataMap.ProcessName ||
-        dataMap.Image ||
-        dataMap.Application ||
-        undefined;
-
-      const processName = processPath ? processPath.split('\\').pop() : undefined;
-
-      const commandLine =
-        dataMap.CommandLine ||
-        dataMap.ScriptBlockText ||
-        dataMap.Path ||
-        undefined;
-
-      const ipAddress =
-        dataMap.IpAddress ||
-        dataMap.SourceAddress ||
-        dataMap.WorkstationName ||
-        undefined;
-
-      const taskCategory = extractStringVal(system.Task) || undefined;
-
-      // Metadata lookup
-      const known = KNOWN_EVENT_IDS[eventId];
-      let isSuspicious = Boolean(known?.suspicious);
-      let suspiciousReason = known?.reason;
-
-      // Analyze command line threats
-      const cmdThreat = analyzeCommandLineThreats(commandLine);
-      if (cmdThreat.isSuspicious) {
-        isSuspicious = true;
-        suspiciousReason = cmdThreat.suspiciousReason;
-      }
-
-      if (eventId === 4625) {
-        isSuspicious = true;
-        suspiciousReason = `Failed authentication for account ${user || 'Unknown'} from IP ${ipAddress || 'Host'}`;
-      } else if (eventId === 1102 || eventId === 104) {
-        isSuspicious = true;
-        suspiciousReason = 'CRITICAL: Security/System event log audit clear operation performed';
-      }
-
-      const eventName = known
-        ? `Event ${eventId}: ${known.name}`
-        : `Event ${eventId} [${channel}]`;
-      const description = known
-        ? known.name
-        : `Windows Event Log ID ${eventId} recorded in ${channel}`;
-
-      const winEventData: WindowsEventData = {
-        eventId,
-        provider,
-        channel,
-        level: isSuspicious ? (eventId === 1102 ? 'Critical' : 'Warning') : level,
-        computer,
-        user,
-        userSid,
-        accountName: user,
-        recordId: rec.recordID,
-        processName,
-        processPath,
-        commandLine,
-        ipAddress: ipAddress !== '-' ? ipAddress : undefined,
-        taskCategory,
-        description,
-      };
-
-      const displayValue = commandLine
-        ? `${processName || 'Process'}: ${commandLine.slice(0, 100)}`
-        : user
-        ? `User: ${user} on ${computer}`
-        : `Event ID ${eventId} [${channel}]`;
-
-      results.push({
-        id: `art-evtx-${rec.recordID || recordCount}-${crypto.randomUUID().slice(0, 6)}`,
-        category: 'windows_events',
-        name: eventName,
-        timestamp,
-        sourceFile: fileName,
-        sourceLocation: `${fileName} > Record #${rec.recordID || recordCount} (${channel})`,
-        description,
-        value: displayValue,
-        details: {
-          'Event ID': eventId,
-          'Record ID': rec.recordID,
-          'Channel / Log': channel,
-          'Provider': provider,
-          'Event Level': winEventData.level,
-          'Computer Host': computer,
-          ...(user ? { 'Account User': user } : {}),
-          ...(userSid ? { 'User SID': userSid } : {}),
-          ...(ipAddress ? { 'Network Source IP': ipAddress } : {}),
-          ...(processName ? { 'Process Name': processName } : {}),
-          ...(processPath ? { 'Process Path': processPath } : {}),
-          ...(commandLine ? { 'Executed Command Line': commandLine.slice(0, 250) } : {}),
-        },
-        isSuspicious,
-        suspiciousReason,
-        rawText: JSON.stringify(eventObj, null, 2).slice(0, 1500),
-        eventData: winEventData,
-      });
     }
   } catch (err) {
-    console.warn('winevtx parseEvtxFile threw an error; falling back to chunk scanner:', err);
+    console.warn('parseEvtxFile stopped or threw error; continuing to per-chunk scan:', err);
   }
 
-  // Fallback: If 0 records parsed (e.g. dirty chunks or corrupted header), scan chunk records directly
+  // Step 2: Iterate all chunks in the EVTX file.
+  // In active or crashed Windows logs, winevtx skips chunks where lastEventRecID == 0xffffffffffffffffn
+  // or terminates on any single BinXML error. Here we process EVERY chunk individually.
+  for (let offset = headerBlockSize; offset + 65536 <= buf.length && results.length < maxTotalRecords; offset += 65536) {
+    const chunkHeader = buf.subarray(offset, offset + 128);
+    if (chunkHeader.subarray(0, 7).toString('ascii') !== 'ElfChnk') {
+      continue;
+    }
+
+    const chunkIndex = Math.floor((offset - headerBlockSize) / 65536);
+    let chunkRecordsParsed = 0;
+
+    // Try parseEvtxChunk for this chunk
+    try {
+      const chunkGen = parseEvtxChunk(buf, chunkIndex);
+      for (const rec of chunkGen) {
+        if (results.length >= maxTotalRecords) break;
+        try {
+          const item = convertWinevtxRecordToArtifact(rec, fileName, lastModified, results.length + 1);
+          if (item && !seenKeys.has(item.key)) {
+            seenKeys.add(item.key);
+            results.push(item.artifact);
+            chunkRecordsParsed++;
+          }
+        } catch {
+          // Ignore individual record error
+        }
+      }
+    } catch {
+      // Chunk may have lastEventRecID == 0xffffffffffffffffn (active chunk) or damaged template table
+    }
+
+    // If parseEvtxChunk parsed nothing or threw, carve records directly from this 64KB chunk!
+    if (chunkRecordsParsed === 0 && results.length < maxTotalRecords) {
+      const chunkCarved = carveRecordsFromSingleChunk(
+        buf,
+        offset,
+        offset + 65536,
+        fileName,
+        lastModified,
+        results.length,
+        maxTotalRecords - results.length
+      );
+      for (const item of chunkCarved) {
+        if (!seenKeys.has(item.key)) {
+          seenKeys.add(item.key);
+          results.push(item.artifact);
+        }
+      }
+    }
+  }
+
+  // Step 3: If still no records parsed, carve the entire file buffer
   if (results.length === 0) {
-    const carvedResults = carveEvtxRecordsFromBuffer(buf, fileName, lastModified);
+    const carvedResults = carveEvtxRecordsFromBuffer(buf, fileName, lastModified, maxTotalRecords);
     results.push(...carvedResults);
   }
 
   return results;
+}
+
+/**
+ * Carves EVTX records from a single 64KB chunk (skipping 512-byte chunk header)
+ */
+function carveRecordsFromSingleChunk(
+  buf: Buffer,
+  startOffset: number,
+  endOffset: number,
+  fileName: string,
+  lastModified: number,
+  initialCount: number,
+  maxToExtract: number
+): Array<{ key: string; artifact: ForensicArtifact }> {
+  const carved: Array<{ key: string; artifact: ForensicArtifact }> = [];
+  let offset = startOffset + 512; // Skip 512-byte ElfChnk header
+
+  while (offset + 24 < endOffset && carved.length < maxToExtract) {
+    // Record magic: 0x2A 0x2A 0x00 0x00
+    if (
+      buf[offset] === 0x2a &&
+      buf[offset + 1] === 0x2a &&
+      buf[offset + 2] === 0x00 &&
+      buf[offset + 3] === 0x00
+    ) {
+      try {
+        const size = buf.readUInt32LE(offset + 4);
+        const recordID = Number(buf.readBigUInt64LE(offset + 8));
+        const fileTime = buf.readBigUInt64LE(offset + 16);
+
+        if (size >= 24 && size <= 65536 && offset + size <= endOffset) {
+          const recSlice = buf.subarray(offset + 24, offset + size);
+          const strings = extractUtf16Strings(recSlice);
+
+          let eventId = 0;
+          let computer = 'INVESTIGATION-HOST';
+          let channel = 'Security';
+          let provider = 'Microsoft-Windows-Security-Auditing';
+          let user: string | undefined;
+          let commandLine: string | undefined;
+
+          for (const s of strings) {
+            const num = parseInt(s, 10);
+            if (!eventId && !isNaN(num) && num > 0 && num < 100000 && String(num) === s.trim()) {
+              eventId = num;
+            } else if (s.includes('Microsoft-Windows-') || s.includes('Service Control Manager') || s.includes('Security-Auditing')) {
+              provider = s;
+            } else if (s === 'Security' || s === 'System' || s === 'Application' || s.includes('PowerShell')) {
+              channel = s;
+            } else if (s.includes('.') && s.length < 40 && !s.includes(' ') && !s.includes('\\')) {
+              computer = s;
+            } else if (s.toLowerCase().includes('powershell') || s.toLowerCase().includes('cmd.exe') || s.toLowerCase().includes('.exe')) {
+              commandLine = s;
+            } else if (!user && s.length > 2 && s.length < 30 && !s.includes(':') && !s.includes('\\') && !s.includes('/')) {
+              user = s;
+            }
+          }
+
+          if (eventId > 0 || strings.length >= 2) {
+            let timestamp = formatIsoUtc(new Date(lastModified));
+            if (fileTime > 116444736000000000n) {
+              const unixMs = Number((fileTime - 116444736000000000n) / 10000n);
+              if (unixMs > 0 && unixMs < 2500000000000) {
+                timestamp = formatIsoUtc(new Date(unixMs));
+              }
+            }
+
+            const known = KNOWN_EVENT_IDS[eventId];
+            const cmdThreat = analyzeCommandLineThreats(commandLine);
+            const isSuspicious = Boolean(known?.suspicious) || cmdThreat.isSuspicious;
+
+            const recNum = recordID || (initialCount + carved.length + 1);
+            const winEventData: WindowsEventData = {
+              eventId: eventId || 4624,
+              provider,
+              channel,
+              level: isSuspicious ? 'Warning' : 'Information',
+              computer,
+              user,
+              recordId: recNum,
+              commandLine,
+              description: known?.name || `Windows Event Record #${recNum} carved from EVTX chunk stream`,
+            };
+
+            const key = `${recNum}:${eventId}:${timestamp}`;
+
+            carved.push({
+              key,
+              artifact: {
+                id: `art-evtx-chunk-${recNum}-${crypto.randomUUID().slice(0, 6)}`,
+                category: 'windows_events',
+                name: known ? `Event ${eventId}: ${known.name}` : `Event ID ${eventId || 'Carved'} [${channel}]`,
+                timestamp,
+                sourceFile: fileName,
+                sourceLocation: `${fileName} > Chunk Offset 0x${offset.toString(16).toUpperCase()}`,
+                description: winEventData.description,
+                value: commandLine || (user ? `User: ${user} on ${computer}` : `Record #${recNum}`),
+                details: {
+                  'Event ID': eventId || 'Unresolved',
+                  'Record ID': recNum,
+                  'Offset': `0x${offset.toString(16).toUpperCase()}`,
+                  'Channel': channel,
+                  'Provider': provider,
+                  'Computer': computer,
+                  ...(user ? { 'Account User': user } : {}),
+                  ...(commandLine ? { 'Command Line': commandLine.slice(0, 200) } : {}),
+                },
+                isSuspicious,
+                suspiciousReason: known?.reason || cmdThreat.suspiciousReason,
+                rawText: strings.join(' | ').slice(0, 800),
+                eventData: winEventData,
+              },
+            });
+
+            offset += size;
+            continue;
+          }
+        }
+      } catch {
+        // Continue scan
+      }
+    }
+    offset += 4;
+  }
+
+  return carved;
 }
 
 /**
@@ -429,11 +633,11 @@ export async function parseEvtxBinary(
 function carveEvtxRecordsFromBuffer(
   buf: Buffer,
   fileName: string,
-  lastModified: number
+  lastModified: number,
+  maxCarved = 10000
 ): ForensicArtifact[] {
   const carved: ForensicArtifact[] = [];
-  const maxCarved = 60;
-  let offset = buf.length >= 4096 ? 4096 : 0; // start at chunk 0 or file start
+  let offset = buf.length >= 4096 ? 4096 : 0;
 
   while (offset + 24 < buf.length && carved.length < maxCarved) {
     // Look for record header magic: 0x2A 0x2A 0x00 0x00
@@ -449,11 +653,9 @@ function carveEvtxRecordsFromBuffer(
         const fileTime = buf.readBigUInt64LE(offset + 16);
 
         if (size >= 24 && size <= 65536 && offset + size <= buf.length) {
-          // Extract UTF-16LE strings from this record slice
           const recSlice = buf.subarray(offset + 24, offset + size);
           const strings = extractUtf16Strings(recSlice);
 
-          // Find Event ID if present in strings or common offsets
           let eventId = 0;
           let computer = 'INVESTIGATION-HOST';
           let channel = 'Security';
@@ -463,23 +665,22 @@ function carveEvtxRecordsFromBuffer(
 
           for (const s of strings) {
             const num = parseInt(s, 10);
-            if (!eventId && !isNaN(num) && num > 100 && num < 100000) {
+            if (!eventId && !isNaN(num) && num > 0 && num < 100000 && String(num) === s.trim()) {
               eventId = num;
-            } else if (s.includes('Microsoft-Windows') || s.includes('Service Control Manager')) {
+            } else if (s.includes('Microsoft-Windows-') || s.includes('Service Control Manager') || s.includes('Security-Auditing')) {
               provider = s;
             } else if (s === 'Security' || s === 'System' || s === 'Application' || s.includes('PowerShell')) {
               channel = s;
-            } else if (s.includes('.') && s.length < 40 && !s.includes(' ')) {
+            } else if (s.includes('.') && s.length < 40 && !s.includes(' ') && !s.includes('\\')) {
               computer = s;
-            } else if (s.toLowerCase().includes('powershell') || s.toLowerCase().includes('cmd.exe')) {
+            } else if (s.toLowerCase().includes('powershell') || s.toLowerCase().includes('cmd.exe') || s.toLowerCase().includes('.exe')) {
               commandLine = s;
-            } else if (!user && s.length > 2 && s.length < 30 && !s.includes(':') && !s.includes('\\')) {
+            } else if (!user && s.length > 2 && s.length < 30 && !s.includes(':') && !s.includes('\\') && !s.includes('/')) {
               user = s;
             }
           }
 
-          if (eventId > 0 || strings.length >= 3) {
-            // Calculate timestamp from fileTime
+          if (eventId > 0 || strings.length >= 2) {
             let timestamp = formatIsoUtc(new Date(lastModified));
             if (fileTime > 116444736000000000n) {
               const unixMs = Number((fileTime - 116444736000000000n) / 10000n);
@@ -492,6 +693,7 @@ function carveEvtxRecordsFromBuffer(
             const cmdThreat = analyzeCommandLineThreats(commandLine);
             const isSuspicious = Boolean(known?.suspicious) || cmdThreat.isSuspicious;
 
+            const recNum = recordID || (carved.length + 1);
             const winEventData: WindowsEventData = {
               eventId: eventId || 4624,
               provider,
@@ -499,23 +701,23 @@ function carveEvtxRecordsFromBuffer(
               level: isSuspicious ? 'Warning' : 'Information',
               computer,
               user,
-              recordId: recordID,
+              recordId: recNum,
               commandLine,
-              description: known?.name || `Windows Event Record #${recordID} carved from EVTX binary stream`,
+              description: known?.name || `Windows Event Record #${recNum} carved from EVTX binary stream`,
             };
 
             carved.push({
-              id: `art-evtx-carved-${recordID || offset}-${crypto.randomUUID().slice(0, 6)}`,
+              id: `art-evtx-carved-${recNum}-${crypto.randomUUID().slice(0, 6)}`,
               category: 'windows_events',
               name: known ? `Event ${eventId}: ${known.name}` : `Event ID ${eventId || 'Carved'} [${channel}]`,
               timestamp,
               sourceFile: fileName,
               sourceLocation: `${fileName} > Offset 0x${offset.toString(16).toUpperCase()}`,
               description: winEventData.description,
-              value: commandLine || (user ? `User: ${user} on ${computer}` : `Record #${recordID}`),
+              value: commandLine || (user ? `User: ${user} on ${computer}` : `Record #${recNum}`),
               details: {
                 'Event ID': eventId || 'Unresolved',
-                'Record ID': recordID,
+                'Record ID': recNum,
                 'Offset': `0x${offset.toString(16).toUpperCase()}`,
                 'Channel': channel,
                 'Provider': provider,

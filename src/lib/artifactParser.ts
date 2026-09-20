@@ -14,6 +14,7 @@ import {
 } from '../types';
 import { parseEvtxBinary, parseEvtxTextOrXml } from './evtxParser';
 import { parsePstOrMailboxBinary, parseEmailTextOrMime } from './pstParser';
+import { isRegistryHive, parseRegistryHive } from './registryHiveParser';
 
 export interface CategoryMeta {
   id: ArtifactCategory;
@@ -172,6 +173,29 @@ export async function analyzeArtifactFiles(
       isPstMagic ||
       isOleMsgMagic ||
       /\.(pst|ost|msg|eml|mbox)$/i.test(fileNameLower);
+    const isRegFile = isRegistryHive(headerBuf, file.name);
+
+    // ----------------------------------------------------
+    // Windows Registry Hives (SYSTEM, SOFTWARE, SAM, SECURITY, NTUSER.DAT)
+    // ----------------------------------------------------
+    if (isRegFile) {
+      try {
+        const regSlice = await readFileAsArrayBuffer(file, 128 * 1024 * 1024);
+        const regBuf = Buffer.from(regSlice);
+        const regArtifacts = parseRegistryHive(regBuf, file.name, file.lastModified);
+        for (const art of regArtifacts) {
+          if (art.category === 'system_info' && !options.systemInfo) continue;
+          if (art.category === 'usb_connect' && !options.usbHistory) continue;
+          if (art.category === 'run_keys' && !options.registryHives) continue;
+          if (art.category === 'user_accounts' && !options.userAccounts) continue;
+          if (art.category === 'recent_files' && !options.recentFiles) continue;
+          if (art.category === 'user_activity' && !options.userActivities) continue;
+          results.push(art);
+        }
+      } catch (err) {
+        console.warn(`Error parsing registry hive ${file.name}:`, err);
+      }
+    }
 
     // ----------------------------------------------------
     // 1. Windows Event Logs Analysis (.evtx, .xml, text logs)
@@ -383,9 +407,9 @@ export async function analyzeArtifactFiles(
     }
 
     // ----------------------------------------------------
-    // 5. Registry Hives / Run Keys Analysis
+    // 5. Registry Hives / Run Keys Analysis (Text / Carved Fallback)
     // ----------------------------------------------------
-    if (options.registryHives) {
+    if (options.registryHives && (!isRegFile || results.filter((r) => r.sourceFile === file.name && r.category === 'run_keys').length === 0)) {
       const runKeyRegex = /(SOFTWARE|SYSTEM|Microsoft\\Windows\\CurrentVersion\\(Run|RunOnce|RunServices|Explorer\\UserAssist|Shell Folders))[^\r\n]*/gi;
       let runMatch;
       let runCount = 0;
@@ -417,9 +441,9 @@ export async function analyzeArtifactFiles(
     }
 
     // ----------------------------------------------------
-    // 6. USB Device Connection History
+    // 6. USB Device Connection History (Text / Carved Fallback)
     // ----------------------------------------------------
-    if (options.usbHistory) {
+    if (options.usbHistory && (!isRegFile || results.filter((r) => r.sourceFile === file.name && r.category === 'usb_connect').length === 0)) {
       const usbRegex = /USBSTOR\\[^\s\r\n\x00]+/gi;
       let usbMatch;
       let usbCount = 0;
@@ -485,9 +509,9 @@ export async function analyzeArtifactFiles(
     }
 
     // ----------------------------------------------------
-    // 8. System & OS Info
+    // 8. System & OS Info (Text / Carved Fallback)
     // ----------------------------------------------------
-    if (options.systemInfo) {
+    if (options.systemInfo && (!isRegFile || results.filter((r) => r.sourceFile === file.name && r.category === 'system_info').length === 0)) {
       const sysRegex = /(Windows\s+(?:10|11|Server\s+\d+|7)|CurrentBuild(?:Number)?\s*=\s*\d+|ComputerName\s*=\s*[A-Za-z0-9\-]+|TimeZoneKeyName\s*=\s*[A-Za-z\s]+)/gi;
       let sysMatch;
       let sysCount = 0;
@@ -514,9 +538,9 @@ export async function analyzeArtifactFiles(
     }
 
     // ----------------------------------------------------
-    // 9. User Accounts & Security
+    // 9. User Accounts & Security (Text / Carved Fallback)
     // ----------------------------------------------------
-    if (options.userAccounts) {
+    if (options.userAccounts && (!isRegFile || results.filter((r) => r.sourceFile === file.name && r.category === 'user_accounts').length === 0)) {
       const userRegex = /(Administrator|Guest|DefaultAccount|WDAGUtilityAccount|VictimUser|svc_[a-zA-Z0-9]+|user_[a-zA-Z0-9]+)/gi;
       const seenUsers = new Set<string>();
       let uMatch;
