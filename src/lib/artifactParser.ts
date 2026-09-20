@@ -338,21 +338,27 @@ export async function analyzeArtifactFiles(
     // 3. PST / OST / EML / MSG Email Analysis with Outlook Layout
     // ----------------------------------------------------
     if (options.pstEmails) {
+      let emailCountForThisFile = 0;
       if (isMailboxFile) {
         try {
-          const mailBuffer = await readFileAsArrayBuffer(file, 64 * 1024 * 1024);
+          const mailBuffer = await readFileAsArrayBuffer(file, 128 * 1024 * 1024);
           const mailArtifacts = await parsePstOrMailboxBinary(mailBuffer, file.name, file.lastModified);
           results.push(...mailArtifacts);
+          emailCountForThisFile += mailArtifacts.length;
         } catch (err) {
           console.warn(`Error parsing binary mailbox file ${file.name}:`, err);
         }
       }
 
-      // If not recognized as binary mailbox or if 0 emails were carved, test for RFC822 / text email headers
-      if (!isMailboxFile || results.filter((r) => r.category === 'emails').length === 0) {
-        const textContent = await readFileAsText(file);
-        const emlArtifacts = parseEmailTextOrMime(textContent, file.name, file.lastModified);
-        results.push(...emlArtifacts);
+      // If not recognized as binary mailbox or if 0 emails were carved from this file, test for RFC822 / text email headers
+      if (!isMailboxFile || emailCountForThisFile === 0) {
+        try {
+          const textContent = await readFileAsText(file);
+          const emlArtifacts = parseEmailTextOrMime(textContent, file.name, file.lastModified);
+          results.push(...emlArtifacts);
+        } catch (emlErr) {
+          console.warn(`Error parsing text email format for ${file.name}:`, emlErr);
+        }
       }
     }
 

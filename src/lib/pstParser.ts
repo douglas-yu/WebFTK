@@ -60,6 +60,14 @@ function normalizeFolderName(folderName: string, path: string): ExtractedEmail['
   return 'Inbox';
 }
 
+// Ensure polyfill buffer on global for any sub-modules
+if (typeof globalThis !== 'undefined') {
+  (globalThis as any).Buffer = Buffer;
+}
+if (typeof window !== 'undefined') {
+  (window as any).Buffer = Buffer;
+}
+
 /**
  * Extracts and parses email messages from PST/OST/MSG/EML binary data.
  */
@@ -95,7 +103,7 @@ export async function parsePstOrMailboxBinary(
   const isPstExtension = /\.(pst|ost)$/i.test(fileName);
 
   if (isPstMagic || isPstExtension) {
-    // Attempt object-oriented PST traversal using pst-extractor
+    // Attempt object-oriented PST traversal using pst-extractor (for intact, standard PST files)
     try {
       const pstFile = new PSTFile(buf);
       const rootFolder = pstFile.getRootFolder();
@@ -110,31 +118,37 @@ export async function parsePstOrMailboxBinary(
         );
       }
     } catch (pstErr) {
-      console.warn('PSTFile structural parse error, falling back to deep carver:', pstErr);
+      console.warn('PSTFile structural parse note (falling back to deep carver):', pstErr);
     }
 
-    // If structural parsing didn't find emails (e.g. damaged B-tree or partial carve), run deep MAPI/RFC822 carver
+    // If structural parsing didn't yield emails (damaged B-tree, carved stream, or partial archive), run deep MAPI/RFC822 carver
     if (results.length === 0) {
       const wVer = buf.length > 12 ? buf.readUInt16LE(10) : 23;
-      const bCryptMethod = buf.length > 462 ? buf[461] : 1;
+      // In MS-PST, ANSI cryptMethod is at byte 461, Unicode at byte 513
+      const bCryptMethod =
+        (buf.length > 513 && buf[513] === 1) || (buf.length > 461 && buf[461] === 1) ? 1 : 0;
 
-      let processBuffer = buf;
+      // 1. First try decrypted stream if compressible encryption is indicated
       if (bCryptMethod === 1 && buf.length > 512) {
-        const headerPart = buf.subarray(0, 512);
-        const dataPart = buf.subarray(512);
-        const decodedData = decodePstCompressibleBuffer(dataPart);
-        processBuffer = Buffer.concat([headerPart, decodedData]);
-      }
+        try {
+          const headerPart = buf.subarray(0, 512);
+          const dataPart = buf.subarray(512);
+          const decodedData = decodePstCompressibleBuffer(dataPart);
+          const processBuffer = Buffer.concat([headerPart, decodedData]);
 
-      const carved = carveActualEmailsFromBuffer(processBuffer, fileName, lastModified, wVer, bCryptMethod);
-      for (const item of carved) {
-        if (!seenFingerprints.has(item.fingerprint)) {
-          seenFingerprints.add(item.fingerprint);
-          results.push(item.artifact);
+          const carved = carveActualEmailsFromBuffer(processBuffer, fileName, lastModified, wVer, 1);
+          for (const item of carved) {
+            if (!seenFingerprints.has(item.fingerprint)) {
+              seenFingerprints.add(item.fingerprint);
+              results.push(item.artifact);
+            }
+          }
+        } catch (decErr) {
+          console.warn('Error during compressible decode carving:', decErr);
         }
       }
 
-      // Also try raw buffer if decoded didn't produce results
+      // 2. Scan raw buffer (handles unencrypted, plaintext streams, direct RFC822 blocks, or mixed archives)
       if (results.length === 0) {
         const rawCarved = carveActualEmailsFromBuffer(buf, fileName, lastModified, wVer, 0);
         for (const item of rawCarved) {
@@ -142,6 +156,26 @@ export async function parsePstOrMailboxBinary(
             seenFingerprints.add(item.fingerprint);
             results.push(item.artifact);
           }
+        }
+      }
+
+      // 3. In case the PST file was encrypted but cryptMethod byte was unset or non-standard, attempt compressible pass as well
+      if (results.length === 0 && buf.length > 512) {
+        try {
+          const headerPart = buf.subarray(0, 512);
+          const dataPart = buf.subarray(512);
+          const decodedData = decodePstCompressibleBuffer(dataPart);
+          const processBuffer = Buffer.concat([headerPart, decodedData]);
+
+          const carved = carveActualEmailsFromBuffer(processBuffer, fileName, lastModified, wVer, 1);
+          for (const item of carved) {
+            if (!seenFingerprints.has(item.fingerprint)) {
+              seenFingerprints.add(item.fingerprint);
+              results.push(item.artifact);
+            }
+          }
+        } catch {
+          // ignore
         }
       }
     }
@@ -156,7 +190,7 @@ export async function parsePstOrMailboxBinary(
     results.push(...emlResults);
 
     if (results.length === 0) {
-      // Also try deep email carver
+      // Also try deep email carver across the raw buffer
       const carved = carveActualEmailsFromBuffer(buf, fileName, lastModified, 23, 0);
       for (const item of carved) {
         if (!seenFingerprints.has(item.fingerprint)) {
@@ -167,11 +201,27 @@ export async function parsePstOrMailboxBinary(
     }
   }
 
-  // Global safety fallback: if still 0 emails, test UTF-8 MIME parser
+  // Global safety fallback: if still 0 emails, test UTF-8 / Latin1 MIME parser
   if (results.length === 0) {
-    const text = buf.toString('utf8');
-    const emlResults = parseEmailTextOrMime(text, fileName, lastModified);
-    results.push(...emlResults);
+    const textUtf8 = buf.toString('utf8');
+    const emlResults = parseEmailTextOrMime(textUtf8, fileName, lastModified);
+    for (const item of emlResults) {
+      if (!seenFingerprints.has(item.id)) {
+        seenFingerprints.add(item.id);
+        results.push(item);
+      }
+    }
+  }
+
+  if (results.length === 0) {
+    const textLatin1 = buf.toString('latin1');
+    const emlResults = parseEmailTextOrMime(textLatin1, fileName, lastModified);
+    for (const item of emlResults) {
+      if (!seenFingerprints.has(item.id)) {
+        seenFingerprints.add(item.id);
+        results.push(item);
+      }
+    }
   }
 
   return results;
@@ -395,6 +445,101 @@ function extractEmailsFromPstFolder(
 }
 
 /**
+ * Segments raw buffer or string into individual email blocks using RFC822 / MIME / PST markers
+ */
+function segmentEmailBlocks(rawText: string): string[] {
+  const segments: string[] = [];
+
+  // 1. Check for explicit sample / boundary markers first
+  if (rawText.includes('---END-EMAIL---')) {
+    const parts = rawText.split(/---END-EMAIL---/g);
+    for (const p of parts) {
+      const clean = p.trim();
+      if (clean.length > 20 && (/From:\s*[^\r\n]+/i.test(clean) || /Subject:\s*[^\r\n]+/i.test(clean))) {
+        segments.push(clean);
+      }
+    }
+  }
+
+  // 2. Check for standard MIME boundaries (e.g. ------=_Part_ or --boundary)
+  if (segments.length === 0 && /--[a-zA-Z0-9'()+_,-./:=?]{6,}/.test(rawText)) {
+    const mimeBoundaryMatch = /--([a-zA-Z0-9'()+_,-./:=?]{6,})/g;
+    const boundaryTokens = new Set<string>();
+    let bm;
+    while ((bm = mimeBoundaryMatch.exec(rawText)) !== null && boundaryTokens.size < 5) {
+      boundaryTokens.add(bm[1]);
+    }
+    for (const bToken of boundaryTokens) {
+      const boundarySplits = rawText.split(
+        new RegExp(`--${bToken.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}(?:--)?`, 'g')
+      );
+      for (const sp of boundarySplits) {
+        const clean = sp.trim();
+        if (clean.length > 30 && (/From:\s*[^\r\n]+/i.test(clean) || /Subject:\s*[^\r\n]+/i.test(clean))) {
+          segments.push(clean);
+        }
+      }
+      if (segments.length > 0) break;
+    }
+  }
+
+  // 3. General email header stream carving:
+  // Match standard header beginnings: From:, Return-Path:, Received: from
+  if (segments.length === 0) {
+    const headerRegex = /(?:^|[\r\n]+)(?:From|Return-Path|Received):\s*[^\r\n]+/gi;
+    const matches = Array.from(rawText.matchAll(headerRegex));
+    if (matches.length > 0) {
+      for (let i = 0; i < matches.length; i++) {
+        const start = matches[i].index ?? 0;
+        const end =
+          i < matches.length - 1 ? (matches[i + 1].index ?? rawText.length) : Math.min(rawText.length, start + 32000);
+        const chunk = rawText.slice(start, end).trim();
+        if (chunk.length > 20 && (/From:\s*[^\r\n]+/i.test(chunk) || /Subject:\s*[^\r\n]+/i.test(chunk))) {
+          segments.push(chunk);
+        }
+      }
+    }
+  }
+
+  // 4. If still no segments, check if there's any single From: or Subject: block in the text
+  if (segments.length === 0) {
+    const singleFrom = /From:\s*([^\r\n]+)/i.exec(rawText);
+    if (singleFrom) {
+      const start = singleFrom.index;
+      const chunk = rawText.slice(start).trim();
+      if (chunk.length > 20) {
+        segments.push(chunk);
+      }
+    }
+  }
+
+  return segments;
+}
+
+/**
+ * Extracts the body content of an email, cleanly stripping out headers and boundaries
+ */
+function extractBodyFromEmailBlock(block: string): string {
+  // Find standard header end (double newline after headers)
+  const headerEndMatch = block.match(/\r?\n\r?\n/);
+  if (headerEndMatch && headerEndMatch.index !== undefined) {
+    const rawBody = block.slice(headerEndMatch.index + headerEndMatch[0].length).trim();
+    if (rawBody.length > 0) {
+      return rawBody;
+    }
+  }
+  // Fallback: strip recognized header lines
+  const lines = block.split(/\r?\n/);
+  const bodyLines = lines.filter(
+    (line) =>
+      !/^(?:From|To|Cc|Bcc|Subject|Date|Message-ID|Importance|X-Priority|Return-Path|Received|MIME-Version|Content-Type|Content-Transfer-Encoding|filename):/i.test(
+        line
+      )
+  );
+  return bodyLines.join('\n').trim();
+}
+
+/**
  * Carves actual emails from raw or decrypted buffers without dummy placeholder creation
  */
 function carveActualEmailsFromBuffer(
@@ -405,37 +550,55 @@ function carveActualEmailsFromBuffer(
   cryptMethod: number
 ): Array<{ fingerprint: string; artifact: ForensicArtifact }> {
   const items: Array<{ fingerprint: string; artifact: ForensicArtifact }> = [];
+  const seenFingerprints = new Set<string>();
+  const maxEmails = 100;
+
+  // 1. Scan for ASCII / Latin1 blocks
   const textAscii = buf.toString('latin1');
-  const maxEmails = 60;
+  const blocks = segmentEmailBlocks(textAscii);
 
-  // 1. Scan for RFC822 Internet Header streams (PR_TRANSPORT_MESSAGE_HEADERS)
-  const headerMarkerRegex = /(?:(?:Received|Return-Path|From|Message-ID):\s*([^\r\n]+)[\r\n]+){2,}/gi;
-  let headerMatch;
-
-  while ((headerMatch = headerMarkerRegex.exec(textAscii)) !== null && items.length < maxEmails) {
-    const startIndex = headerMatch.index;
-    const blockEnd = Math.min(startIndex + 16000, textAscii.length);
-    const candidateText = textAscii.slice(startIndex, blockEnd);
-
+  for (let i = 0; i < blocks.length && items.length < maxEmails; i++) {
     const parsed = parseSingleEmailStream(
-      candidateText,
+      blocks[i],
       fileName,
-      `PST Stream 0x${startIndex.toString(16).toUpperCase()}`,
+      `PST Stream #${i + 1}`,
       lastModified,
       items.length + 1
     );
-
-    if (parsed) {
+    if (parsed && !seenFingerprints.has(parsed.fingerprint)) {
+      seenFingerprints.add(parsed.fingerprint);
       items.push(parsed);
     }
   }
 
-  // 2. Scan for UTF-16LE MAPI property blocks
-  if (items.length < 20) {
+  // 2. Also try UTF-8 decoding if Latin1 didn't yield enough
+  if (items.length < 3) {
+    const textUtf8 = buf.toString('utf8');
+    const utf8Blocks = segmentEmailBlocks(textUtf8);
+    for (let i = 0; i < utf8Blocks.length && items.length < maxEmails; i++) {
+      const parsed = parseSingleEmailStream(
+        utf8Blocks[i],
+        fileName,
+        `PST UTF-8 Stream #${i + 1}`,
+        lastModified,
+        items.length + 1
+      );
+      if (parsed && !seenFingerprints.has(parsed.fingerprint)) {
+        seenFingerprints.add(parsed.fingerprint);
+        items.push(parsed);
+      }
+    }
+  }
+
+  // 3. Scan for UTF-16LE MAPI property blocks
+  if (items.length < maxEmails) {
     const utf16Emails = carveUtf16MapiEmails(buf, fileName, lastModified, items.length);
     for (const item of utf16Emails) {
       if (items.length >= maxEmails) break;
-      items.push(item);
+      if (!seenFingerprints.has(item.fingerprint)) {
+        seenFingerprints.add(item.fingerprint);
+        items.push(item);
+      }
     }
   }
 
@@ -443,7 +606,7 @@ function carveActualEmailsFromBuffer(
 }
 
 /**
- * Carves UTF-16LE MAPI property blocks
+ * Carves UTF-16LE MAPI property blocks from Unicode PST/OST
  */
 function carveUtf16MapiEmails(
   buf: Buffer,
@@ -453,23 +616,53 @@ function carveUtf16MapiEmails(
 ): Array<{ fingerprint: string; artifact: ForensicArtifact }> {
   const items: Array<{ fingerprint: string; artifact: ForensicArtifact }> = [];
   const utf16String = buf.toString('utf16le');
+  const seenLocal = new Set<string>();
 
-  const subjectRegex = /(?:Subject|RE|FW|Fwd):\s*([^\r\n]{4,90})/gi;
-  let sMatch;
+  // Find email addresses in the UTF-16 stream
+  const emailRegex = /\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/gi;
+  let eMatch;
   let count = startIndex;
 
-  while ((sMatch = subjectRegex.exec(utf16String)) !== null && items.length < 20) {
-    count++;
-    const rawSubject = sMatch[1].trim();
-    if (rawSubject.length < 3 || rawSubject.includes('\x00')) continue;
+  while ((eMatch = emailRegex.exec(utf16String)) !== null && items.length < 30) {
+    const foundEmail = eMatch[1].toLowerCase();
+    // Skip noisy binary or extension false positives
+    if (
+      foundEmail.endsWith('.png') ||
+      foundEmail.endsWith('.jpg') ||
+      foundEmail.endsWith('.exe') ||
+      foundEmail.endsWith('.dll')
+    ) {
+      continue;
+    }
+    if (seenLocal.has(foundEmail)) continue;
+    seenLocal.add(foundEmail);
 
-    const windowStart = Math.max(0, sMatch.index - 1000);
-    const windowEnd = Math.min(utf16String.length, sMatch.index + 3000);
+    count++;
+    const pos = eMatch.index;
+    const windowStart = Math.max(0, pos - 1500);
+    const windowEnd = Math.min(utf16String.length, pos + 3000);
     const windowText = utf16String.slice(windowStart, windowEnd);
 
-    const emailMatch = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i.exec(windowText);
-    const fromEmail = emailMatch ? emailMatch[1] : 'user@corporate.local';
-    const fromName = fromEmail.split('@')[0].replace(/[._]/g, ' ');
+    // Look for subject around this window
+    const subjMatch = /(?:Subject|RE|FW|Fwd):\s*([^\r\n]{3,90})/i.exec(windowText);
+    let subject = subjMatch ? subjMatch[1].trim() : '';
+    if (!subject) {
+      const cleanLines = windowText
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(
+          (l) =>
+            l.length >= 4 &&
+            l.length <= 80 &&
+            !l.includes('@') &&
+            !l.includes('<') &&
+            !l.includes('\x00')
+        );
+      subject = cleanLines[0] || `Mail Item involving ${foundEmail}`;
+    }
+
+    const fromEmail = foundEmail;
+    const fromName = fromEmail.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 
     const dateMatch = /(?:Date|Sent):\s*([^\r\n]+)/i.exec(windowText);
     let emailDate = formatIsoUtc(new Date(lastModified));
@@ -485,12 +678,12 @@ function carveUtf16MapiEmails(
     const bodyLines = windowText
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .filter((l) => l.length > 8 && !l.includes('Subject:') && !l.includes('Date:'));
+      .filter((l) => l.length > 8 && !l.includes('Subject:') && !l.includes('Date:') && !l.includes('\x00'));
     const bodyText =
       bodyLines.slice(0, 10).join('\n\n') ||
-      `Extracted message communication regarding "${rawSubject}". Stream recovered from Unicode PST block.`;
+      `Extracted message communication involving ${fromName} (${fromEmail}). Stream recovered from Unicode PST block.`;
 
-    const lowerCombined = (rawSubject + ' ' + bodyText + ' ' + fromEmail).toLowerCase();
+    const lowerCombined = (subject + ' ' + bodyText + ' ' + fromEmail).toLowerCase();
     const isPhishing = /urgent|wire transfer|overdue payment|account suspended|verify password|invoice attached|cryptocurrency|gift card|security alert/i.test(
       lowerCombined
     );
@@ -500,10 +693,10 @@ function carveUtf16MapiEmails(
       from: fromEmail,
       fromName,
       to: ['corporate-user@domain.local'],
-      subject: rawSubject,
+      subject,
       date: emailDate,
       bodyText,
-      folder: isPhishing ? 'Junk' : /sent|fw:/i.test(rawSubject) ? 'Sent Items' : 'Inbox',
+      folder: isPhishing ? 'Junk' : /sent|fw:/i.test(subject) ? 'Sent Items' : 'Inbox',
       hasAttachments: false,
       isPhishing,
       phishingReason: isPhishing
@@ -512,28 +705,28 @@ function carveUtf16MapiEmails(
       read: true,
     };
 
-    const fingerprint = `${fromEmail}:${rawSubject}`.toLowerCase();
+    const fingerprint = `${fromEmail}:${subject}`.toLowerCase();
     items.push({
       fingerprint,
       artifact: {
         id: `art-pst-u16-${count}-${crypto.randomUUID().slice(0, 6)}`,
         category: 'emails',
-        name: `Email: ${rawSubject}`,
+        name: `Email: ${subject}`,
         timestamp: emailDate,
         sourceFile: fileName,
         sourceLocation: `${fileName} > PST Unicode Block #${count}`,
-        description: `Outlook PST message from ${fromName} (${fromEmail})`,
-        value: `Subject: ${rawSubject} | From: ${fromEmail}`,
+        description: `Outlook PST message involving ${fromName} (${fromEmail})`,
+        value: `Subject: ${subject} | From: ${fromEmail}`,
         details: {
           'From': `${fromName} <${fromEmail}>`,
           'To': 'corporate-user@domain.local',
-          'Subject': rawSubject,
+          'Subject': subject,
           'Date': emailDate,
           'Folder': emailData.folder,
         },
         isSuspicious: isPhishing,
         suspiciousReason: emailData.phishingReason,
-        rawText: windowText.slice(0, 800),
+        rawText: windowText.slice(0, 1000),
         emailData,
       },
     });
@@ -550,9 +743,20 @@ function carveEmailsFromMsgBuffer(
   fileName: string,
   lastModified: number
 ): ForensicArtifact[] {
-  const text = buf.toString('latin1');
-  const parsed = parseSingleEmailStream(text, fileName, 'MSG Compound File', lastModified, 1);
-  return parsed ? [parsed.artifact] : [];
+  const results: ForensicArtifact[] = [];
+  const textLatin1 = buf.toString('latin1');
+  const parsed = parseSingleEmailStream(textLatin1, fileName, 'MSG Compound File', lastModified, 1);
+  if (parsed) {
+    results.push(parsed.artifact);
+  }
+
+  // Also check UTF-16LE inside MSG
+  const u16Items = carveUtf16MapiEmails(buf, fileName, lastModified, results.length);
+  for (const item of u16Items) {
+    results.push(item.artifact);
+  }
+
+  return results;
 }
 
 /**
@@ -565,14 +769,13 @@ function parseSingleEmailStream(
   lastModified: number,
   index: number
 ): { fingerprint: string; artifact: ForensicArtifact } | null {
+  // 1. From extraction
   const fromMatch = /From:\s*([^<\r\n]+)?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})?>?/i.exec(
     rawBlock
   );
-  if (!fromMatch) return null;
+  let fromEmail = fromMatch ? (fromMatch[2] || fromMatch[1]?.trim() || 'unknown@sender.com') : 'unknown@sender.com';
+  let fromName = fromMatch ? fromMatch[1]?.trim() : '';
 
-  const rawFrom = fromMatch[0];
-  const fromEmail = fromMatch[2] || fromMatch[1]?.trim() || 'unknown@domain.com';
-  let fromName = fromMatch[1]?.trim();
   if (fromName && (fromName.startsWith('"') || fromName.startsWith("'"))) {
     fromName = fromName.slice(1, -1).trim();
   }
@@ -580,19 +783,28 @@ function parseSingleEmailStream(
     fromName = fromEmail.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
+  // 2. To extraction
   const toMatch = /To:\s*([^\r\n]+)/i.exec(rawBlock);
   const toList = toMatch
     ? toMatch[1].split(/[,;]/).map((t) => t.trim()).filter(Boolean)
-    : ['investigation-team@opencase.local'];
+    : ['analyst@organization.local'];
 
+  // 3. Subject extraction
+  const subjMatch = /Subject:\s*([^\r\n]+)/i.exec(rawBlock);
+  const subject = subjMatch ? subjMatch[1].trim() : `Extracted Message #${index}`;
+
+  // If both fromMatch and subjMatch are missing, skip this candidate block
+  if (!fromMatch && !subjMatch) {
+    return null;
+  }
+
+  // 4. Cc extraction
   const ccMatch = /Cc:\s*([^\r\n]+)/i.exec(rawBlock);
   const ccList = ccMatch
     ? ccMatch[1].split(/[,;]/).map((t) => t.trim()).filter(Boolean)
     : undefined;
 
-  const subjMatch = /Subject:\s*([^\r\n]+)/i.exec(rawBlock);
-  const subject = subjMatch ? subjMatch[1].trim() : 'No Subject';
-
+  // 5. Date extraction
   const dateMatch = /Date:\s*([^\r\n]+)/i.exec(rawBlock);
   let emailDate = formatIsoUtc(new Date(lastModified));
   if (dateMatch) {
@@ -608,15 +820,18 @@ function parseSingleEmailStream(
     }
   }
 
+  // 6. Message-ID extraction
   const midMatch = /Message-ID:\s*<([^>]+)>/i.exec(rawBlock);
   const messageId = midMatch ? midMatch[1] : `<msg-${crypto.randomUUID().slice(0, 12)}@exchange.local>`;
 
+  // 7. Importance
   const impMatch = /(?:Importance|X-Priority):\s*([^\r\n]+)/i.exec(rawBlock);
   let importance: ExtractedEmail['importance'] = 'Normal';
   if (impMatch && /high|1|urgent/i.test(impMatch[1])) {
     importance = 'High';
   }
 
+  // 8. Attachments
   const attachmentRegex = /(?:filename|name)=["']?([^"';\r\n]+\.(?:exe|iso|zip|pdf|docx|xlsx|pptx|scr|vbs|js|bat|png|jpg|rar|7z))["']?/gi;
   const attachments: ExtractedEmailAttachment[] = [];
   let attMatch;
@@ -628,16 +843,20 @@ function parseSingleEmailStream(
       size: Math.floor(Math.random() * 450000) + 12000,
       type: attName.split('.').pop()?.toUpperCase() || 'BIN',
       isSuspicious: isSuspAtt,
+      suspiciousReason: isSuspAtt
+        ? `Potentially executable or script attachment extension (.${attName.split('.').pop()})`
+        : undefined,
     });
   }
 
-  const bodySplit = rawBlock.split(/\r?\n\r?\n/);
-  let bodyText = bodySplit.slice(1).join('\n\n').trim();
+  // 9. Clean Body extraction
+  let bodyText = extractBodyFromEmailBlock(rawBlock);
   if (!bodyText || bodyText.length < 5) {
     bodyText = `Extracted email communication regarding "${subject}". Original message body archived in PST/OST evidence store.`;
   }
 
-  const combinedLower = (subject + ' ' + bodyText + ' ' + rawFrom).toLowerCase();
+  // 10. Threat & Phishing scoring
+  const combinedLower = (subject + ' ' + bodyText + ' ' + fromName + ' ' + fromEmail).toLowerCase();
   const hasPhishingKeywords = /urgent|wire transfer|overdue payment|account suspended|verify your password|invoice attached|cryptocurrency|gift card|click here to verify|security alert|action required/i.test(
     combinedLower
   );
@@ -647,7 +866,7 @@ function parseSingleEmailStream(
   let phishingReason: string | undefined;
   if (hasSuspiciousAtt && hasPhishingKeywords) {
     phishingReason =
-      'High-Risk Phishing: Urgent financial or coercive terminology combined with high-risk executable/script payload';
+      'High-Risk Phishing: Urgent financial or coercive terminology combined with high-risk executable payload';
   } else if (hasSuspiciousAtt) {
     phishingReason =
       'Malicious Payload Flag: Contains potentially executable or script attachment in email transmission';
@@ -659,7 +878,7 @@ function parseSingleEmailStream(
   let folder: ExtractedEmail['folder'] = 'Inbox';
   if (isPhishing) {
     folder = 'Junk';
-  } else if (/sent|outbox/i.test(rawBlock) || rawFrom.includes('user') || rawFrom.includes('investigation')) {
+  } else if (/sent|outbox/i.test(rawBlock) || /sent/i.test(subject)) {
     folder = 'Sent Items';
   }
 
@@ -671,7 +890,7 @@ function parseSingleEmailStream(
     cc: ccList,
     subject,
     date: emailDate,
-    bodyText: bodyText.slice(0, 4000),
+    bodyText: bodyText.slice(0, 8000),
     folder,
     hasAttachments: attachments.length > 0,
     attachments: attachments.length > 0 ? attachments : undefined,
@@ -727,14 +946,11 @@ export function parseEmailTextOrMime(
   const maxMails = 60;
   const seenFingerprints = new Set<string>();
 
-  const msgBlocks = textContent.split(/(?=^From\s+[^\r\n]+|^Received:\s+from|^Return-Path:\s*<)/im);
+  const blocks = segmentEmailBlocks(textContent);
 
-  for (let i = 0; i < msgBlocks.length && results.length < maxMails; i++) {
-    const block = msgBlocks[i].trim();
-    if (block.length < 20) continue;
-
+  for (let i = 0; i < blocks.length && results.length < maxMails; i++) {
     const parsed = parseSingleEmailStream(
-      block,
+      blocks[i],
       fileName,
       `Message #${results.length + 1}`,
       lastModified,
@@ -747,6 +963,7 @@ export function parseEmailTextOrMime(
     }
   }
 
+  // If segmenting didn't produce individual blocks, try parsing the whole block
   if (results.length === 0) {
     const parsed = parseSingleEmailStream(
       textContent,

@@ -29,20 +29,23 @@ import {
   Filter,
   ExternalLink,
   ShieldCheck,
-  Table
+  Table,
+  FolderArchive
 } from 'lucide-react';
 import { ForensicArtifact, ExtractedEmail } from '../types';
 
 interface OutlookEmailViewProps {
   emailArtifacts: ForensicArtifact[];
   onSwitchToTableView?: () => void;
+  onOpenLoadModal?: () => void;
 }
 
 type FolderFilter = 'all' | 'Inbox' | 'Sent Items' | 'Deleted Items' | 'Drafts' | 'Junk';
 
 export default function OutlookEmailView({ 
   emailArtifacts, 
-  onSwitchToTableView 
+  onSwitchToTableView,
+  onOpenLoadModal
 }: OutlookEmailViewProps) {
   const [selectedFolder, setSelectedFolder] = useState<FolderFilter>('all');
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
@@ -489,8 +492,10 @@ export default function OutlookEmailView({
             })}
 
             {filteredEmails.length === 0 && (
-              <div className="p-8 text-center text-zinc-600 italic text-xs">
-                No emails matching active folder or filter criteria
+              <div className="p-8 text-center text-zinc-600 italic text-xs leading-relaxed">
+                {emailsWithArtifact.length === 0
+                  ? 'No mailbox evidence loaded. Load a PST, OST, MSG, or EML file to inspect messages.'
+                  : 'No emails matching active folder or filter criteria'}
               </div>
             )}
           </div>
@@ -696,16 +701,27 @@ export default function OutlookEmailView({
               </div>
             </div>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center select-none">
-              <div className="w-12 h-12 rounded-full bg-zinc-900 flex items-center justify-center text-zinc-600 mb-3">
-                <Mail className="w-6 h-6" />
+            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center select-none font-sans">
+              <div className="w-14 h-14 rounded-2xl bg-zinc-900/80 border border-zinc-800 flex items-center justify-center text-blue-400 mb-4 shadow-inner">
+                <Mail className="w-7 h-7 opacity-80" />
               </div>
-              <p className="text-xs font-semibold text-zinc-400">
-                Select an email from the list
+              <h3 className="text-sm font-bold text-zinc-200 uppercase tracking-wider mb-1">
+                {emailsWithArtifact.length === 0 ? 'No Outlook Mailbox Artifacts Loaded' : 'Select an Email Message'}
+              </h3>
+              <p className="text-xs text-zinc-500 max-w-sm mb-5 leading-relaxed">
+                {emailsWithArtifact.length === 0
+                  ? 'Import a PST, OST, MSG, or EML mailbox evidence file to inspect email messages, detect phishing attacks, and examine suspicious attachments.'
+                  : 'Select an email from the folder list on the left to inspect RFC822 headers, attachments, and formatted message body.'}
               </p>
-              <p className="text-[11px] text-zinc-600 mt-1">
-                View headers, attachment records, and formatted message body
-              </p>
+              {emailsWithArtifact.length === 0 && onOpenLoadModal && (
+                <button
+                  onClick={onOpenLoadModal}
+                  className="px-4 py-2 rounded text-xs font-bold uppercase tracking-wider text-white bg-blue-600 hover:bg-blue-500 transition-colors shadow-md shadow-blue-900/20 flex items-center gap-2"
+                >
+                  <FolderArchive className="w-3.5 h-3.5" />
+                  Load Mailbox Evidence
+                </button>
+              )}
             </div>
           )}
         </div>

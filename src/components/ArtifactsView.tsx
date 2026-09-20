@@ -160,12 +160,13 @@ export default function ArtifactsView({
   const emailArtifacts = useMemo(() => artifacts.filter(a => a.category === 'emails'), [artifacts]);
 
   // If user selected emails and is in Outlook view mode, display the 3-pane Outlook viewer
-  if (activeCategory === 'emails' && emailViewMode === 'outlook' && emailArtifacts.length > 0) {
+  if (activeCategory === 'emails' && emailViewMode === 'outlook') {
     return (
       <div className="flex-1 flex flex-col min-h-0">
         <OutlookEmailView
           emailArtifacts={emailArtifacts}
           onSwitchToTableView={() => setEmailViewMode('table')}
+          onOpenLoadModal={onOpenLoadModal}
         />
       </div>
     );

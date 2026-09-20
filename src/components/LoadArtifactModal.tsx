@@ -107,12 +107,12 @@ export default function LoadArtifactModal({
       windowsEvents: true,
       recentFiles: true,
       pstEmails: true,
-      browserHistory: false,
-      usbDevices: false,
-      networkShares: false,
-      shellbags: false,
-      sqliteDb: false,
-      userAccounts: false,
+      browserHistory: true,
+      registryHives: true,
+      userActivities: true,
+      usbHistory: true,
+      systemInfo: true,
+      userAccounts: true,
     });
   };
 
