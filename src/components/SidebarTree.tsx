@@ -21,7 +21,8 @@ import {
   ShieldAlert,
   Terminal,
   FolderGit2,
-  Mail
+  Mail,
+  Database
 } from 'lucide-react';
 import { FolderNode, ArtifactCategory, SidebarMode, ForensicArtifact } from '../types';
 
@@ -306,9 +307,24 @@ function CategoryItem({
 
 function TreeNode({ node, folders, selectedPath, onSelectPath, depth }: any) {
   if (!node) return null;
-  const [isOpen, setIsOpen] = useState(depth === 0);
+  const [isOpen, setIsOpen] = useState(depth <= 1);
   const isSelected = selectedPath === node.path;
   const hasChildren = Boolean(node.children && node.children.length > 0);
+
+  // Determine icon based on node type
+  let NodeIcon = Folder;
+  let iconColor = 'text-zinc-600';
+
+  if (node.isDiskImage) {
+    NodeIcon = HardDrive;
+    iconColor = 'text-blue-400';
+  } else if (node.isPartition) {
+    NodeIcon = Database;
+    iconColor = 'text-emerald-400';
+  } else if (isOpen) {
+    NodeIcon = FolderOpen;
+    iconColor = 'text-amber-500/70';
+  }
 
   return (
     <div>
@@ -317,18 +333,34 @@ function TreeNode({ node, folders, selectedPath, onSelectPath, depth }: any) {
           onSelectPath(node.path);
           if (hasChildren) setIsOpen(!isOpen);
         }}
-        className={`flex items-center gap-1 py-1.5 px-2 cursor-pointer transition-colors ${
-          isSelected ? 'bg-blue-900/30 text-blue-400 border-r-2 border-blue-500' : 'hover:bg-zinc-900 text-zinc-400'
+        className={`flex items-center gap-1.5 py-1.5 px-2 cursor-pointer transition-colors group ${
+          isSelected 
+            ? 'bg-blue-900/30 text-blue-300 border-r-2 border-blue-500 font-medium' 
+            : 'hover:bg-zinc-900 text-zinc-400'
         }`}
-        style={{ paddingLeft: `${(depth * 12) + 8}px` }}
+        style={{ paddingLeft: `${(depth * 14) + 8}px` }}
       >
-        <span className="w-4 flex items-center justify-center">
+        <span className="w-3.5 flex items-center justify-center shrink-0">
           {hasChildren ? (
-            isOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />
+            isOpen ? <ChevronDown className="w-3 h-3 text-zinc-500" /> : <ChevronRight className="w-3 h-3 text-zinc-500" />
           ) : null}
         </span>
-        {isOpen ? <FolderOpen className="w-3.5 h-3.5 text-blue-500/50" /> : <Folder className="w-3.5 h-3.5 text-zinc-600" />}
-        <span className="truncate">{node.name || 'Root'}</span>
+        <NodeIcon className={`w-3.5 h-3.5 shrink-0 ${iconColor}`} />
+        <span className="truncate text-xs">{node.name || 'Root'}</span>
+
+        {/* Partition or Filesystem tag */}
+        {node.filesystemType && (
+          <span className="ml-1 px-1 rounded text-[8px] font-mono bg-zinc-850 text-zinc-400 border border-zinc-800 shrink-0">
+            {node.filesystemType}
+          </span>
+        )}
+
+        {/* Deleted file counter badge */}
+        {node.deletedFileCount && node.deletedFileCount > 0 ? (
+          <span className="ml-auto px-1.5 py-0.2 rounded text-[8px] font-mono font-bold bg-red-950/80 text-red-400 border border-red-900/50 shrink-0" title={`${node.deletedFileCount} recovered deleted items`}>
+            {node.deletedFileCount} del
+          </span>
+        ) : null}
       </div>
       
       {isOpen && hasChildren && (

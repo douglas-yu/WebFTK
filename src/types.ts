@@ -16,6 +16,17 @@ export interface ForensicFile {
   extensionMismatch: boolean;
   path: string; // File path relative to source
   parentPath: string;
+  // Forensic disk image properties
+  isDeleted?: boolean;
+  inode?: number | string;
+  mftRecordId?: number;
+  sectorOffset?: number;
+  partitionName?: string;
+  imageSource?: string;
+  filesystem?: string;
+  createdTime?: string;
+  modifiedTime?: string;
+  accessedTime?: string;
 }
 
 export interface FolderNode {
@@ -24,6 +35,53 @@ export interface FolderNode {
   path: string;
   children: string[]; // Child folder IDs
   fileIds: string[]; // File IDs in this folder
+  isPartition?: boolean;
+  isDiskImage?: boolean;
+  partitionType?: string;
+  filesystemType?: string;
+  deletedFileCount?: number;
+  totalSize?: number;
+}
+
+export interface PartitionInfo {
+  id: string;
+  name: string;
+  type: string;
+  filesystem: string;
+  startSector: number;
+  sectorCount: number;
+  sizeBytes: number;
+  bootable: boolean;
+}
+
+export interface DiskImageInfo {
+  fileName: string;
+  fileSize: number;
+  format: 'E01' | 'DD' | 'RAW' | 'IMG' | 'ISO' | 'VMDK';
+  totalSectors: number;
+  bytesPerSector: number;
+  caseInfo?: {
+    caseNumber?: string;
+    evidenceNumber?: string;
+    examiner?: string;
+    description?: string;
+    notes?: string;
+    acquisitionDate?: string;
+    systemDate?: string;
+  };
+  partitions: PartitionInfo[];
+  hashes?: {
+    md5?: string;
+    sha1?: string;
+    sha256?: string;
+  };
+}
+
+export interface DiskImageParseResult {
+  imageInfo: DiskImageInfo;
+  files: Record<string, ForensicFile>;
+  folders: Record<string, FolderNode>;
+  rootPaths: string[];
 }
 
 export type ViewMode = 'explorer' | 'hex' | 'metadata' | 'search';

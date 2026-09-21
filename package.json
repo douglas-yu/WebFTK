@@ -17,6 +17,7 @@
     "buffer": "^6.0.3",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "fflate": "^0.8.3",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "pst-extractor": "^1.12.0",

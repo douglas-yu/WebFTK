@@ -103,15 +103,34 @@ export default function ContentViewer({ file }: ContentViewerProps) {
 
         {activeTab === 'properties' && (
           <div className="h-full overflow-auto p-8 bg-zinc-950 custom-scrollbar">
-            <h3 className="text-zinc-500 font-bold uppercase tracking-widest text-[10px] mb-6 flex items-center gap-2">
-               Full Catalog Attributes
+            <h3 className="text-zinc-500 font-bold uppercase tracking-widest text-[10px] mb-6 flex items-center justify-between">
+              <span className="flex items-center gap-2">Full Forensic Catalog Attributes</span>
+              {file.isDeleted && (
+                <span className="px-2 py-0.5 rounded text-[9px] font-black bg-red-950 text-red-400 border border-red-900/60 uppercase tracking-widest">
+                  DELETED / CARVED OBJECT
+                </span>
+              )}
             </h3>
             <div className="grid grid-cols-2 gap-x-12 gap-y-6">
               <Attribute label="Object Name" value={file.name} />
               <Attribute label="Data Size" value={`${file.size} bytes (${formatBytes(file.size)})`} />
+              <Attribute 
+                label="Forensic Status" 
+                value={file.isDeleted ? 'UNALLOCATED / DELETED FILE RECOVERED' : 'ACTIVE / ALLOCATED'} 
+                alert={file.isDeleted}
+                highlight={!file.isDeleted}
+              />
               <Attribute label="MIME Signature" value={file.type || 'None identified'} />
               <Attribute label="Path In Image" value={file.path} />
-              <Attribute label="Time Stamp (MOD)" value={new Date(file.lastModified).toLocaleString()} />
+              {file.partitionName && <Attribute label="Source Partition" value={file.partitionName} />}
+              {file.filesystem && <Attribute label="Filesystem Type" value={file.filesystem} />}
+              {file.imageSource && <Attribute label="Disk Image Container" value={file.imageSource} />}
+              {file.mftRecordId && <Attribute label="NTFS MFT Record" value={`Record #${file.mftRecordId}`} mono />}
+              {file.inode && <Attribute label="Inode / Cluster ID" value={String(file.inode)} mono />}
+              {file.sectorOffset && <Attribute label="Physical Sector Offset" value={`LBA ${file.sectorOffset} (0x${(file.sectorOffset * 512).toString(16).toUpperCase()})`} mono />}
+              <Attribute label="Time Stamp (MOD)" value={file.modifiedTime || new Date(file.lastModified).toLocaleString()} />
+              {file.createdTime && <Attribute label="Time Stamp (CREATE)" value={file.createdTime} />}
+              {file.accessedTime && <Attribute label="Time Stamp (ACCESS)" value={file.accessedTime} />}
               <Attribute label="Hash (SHA-256)" value={file.hash || 'Not calculated'} mono />
               <Attribute label="Magic Bytes Match" value={file.signatureMatch || 'Unknown'} highlight={!!file.signatureMatch} />
               <Attribute label="Entropy Warning" value={file.extensionMismatch ? 'SUSPICIOUS MISMATCH' : 'Normal'} alert={file.extensionMismatch} />
