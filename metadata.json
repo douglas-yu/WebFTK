@@ -1,6 +1,6 @@
 {
   "name": "OpenCase Forensic",
-  "description": "A professional-grade, local-first digital file forensics application. Features include hex viewing, file signature verification, metadata extraction, and hash calculation—all performed locally in your browser for privacy.",
+  "description": "A professional-grade, local-first digital forensics application. Features include forensic disk image mounting (E01, DD, RAW), MBR/GPT partition parsing, filesystem reconstruction, artifact parsing, hex viewing, file signature verification, and hash calculation.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

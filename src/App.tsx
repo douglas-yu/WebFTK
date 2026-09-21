@@ -25,13 +25,15 @@ import {
   FolderArchive
 } from 'lucide-react';
 
-import { ForensicFile, FolderNode, ViewMode, ForensicArtifact, ArtifactCategory, SidebarMode } from './types';
+import { ForensicFile, FolderNode, ViewMode, ForensicArtifact, ArtifactCategory, SidebarMode, DiskImageParseResult, DiskImageInfo } from './types';
 import { calculateHash, getFileHead, detectSignature, formatBytes } from './lib/forensics';
+import { isDiskImageFile } from './lib/diskImageParser';
 import FileTable from './components/FileTable';
 import SidebarTree from './components/SidebarTree';
 import ContentViewer from './components/ContentViewer';
 import ArtifactsView from './components/ArtifactsView';
 import LoadArtifactModal from './components/LoadArtifactModal';
+import LoadDiskImageModal from './components/LoadDiskImageModal';
 
 export default function App() {
   const [files, setFiles] = useState<Record<string, ForensicFile>>({});
@@ -47,6 +49,8 @@ export default function App() {
   const [activeArtifactCategory, setActiveArtifactCategory] = useState<ArtifactCategory>('all');
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>('tree');
   const [isLoadModalOpen, setIsLoadModalOpen] = useState(false);
+  const [isDiskModalOpen, setIsDiskModalOpen] = useState(false);
+  const [mountedImages, setMountedImages] = useState<DiskImageInfo[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dirInputRef = useRef<HTMLInputElement>(null);
@@ -55,6 +59,24 @@ export default function App() {
     setArtifacts(newArtifacts);
     setSidebarMode('artifacts');
     setActiveArtifactCategory('all');
+  };
+
+  const handleDiskImageLoaded = (result: DiskImageParseResult) => {
+    setMountedImages((prev) => [...prev, result.imageInfo]);
+    setFiles((prev) => ({ ...prev, ...result.files }));
+    setFolders((prev) => ({ ...prev, ...result.folders }));
+    setRootPaths((prev) => Array.from(new Set([...result.rootPaths, ...prev])));
+    setSidebarMode('tree');
+
+    // Auto-select the first partition or root folder
+    if (result.rootPaths.length > 0) {
+      const rootNode = result.folders[result.rootPaths[0]];
+      if (rootNode && rootNode.children && rootNode.children.length > 0) {
+        setSelectedFolderId(rootNode.children[0]);
+      } else {
+        setSelectedFolderId(result.rootPaths[0]);
+      }
+    }
   };
 
   // Helper to process added files into a tree
@@ -141,11 +163,25 @@ export default function App() {
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
-    if (e.dataTransfer.files) processFiles(e.dataTransfer.files);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const firstFile = e.dataTransfer.files[0];
+      if (isDiskImageFile(firstFile.name)) {
+        setIsDiskModalOpen(true);
+        return;
+      }
+      processFiles(e.dataTransfer.files);
+    }
   };
 
   const handleAddFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) processFiles(e.target.files);
+    if (e.target.files) {
+      const firstFile = e.target.files[0];
+      if (firstFile && isDiskImageFile(firstFile.name)) {
+        setIsDiskModalOpen(true);
+        return;
+      }
+      processFiles(e.target.files);
+    }
   };
 
   // Analysis Logic for pending files
@@ -229,7 +265,15 @@ export default function App() {
               OpenCase <span className="h-4 w-px bg-zinc-800" /> <span className="text-zinc-600 font-sans not-italic text-[10px] uppercase font-bold tracking-widest">Digital Forensics Engine</span>
             </h1>
             <div className="flex gap-2">
-              {/* Requested Primary Button: Load Artifact File */}
+              {/* Primary Forensic Actions */}
+              <button 
+                onClick={() => setIsDiskModalOpen(true)} 
+                className="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-1 rounded text-[10px] font-bold uppercase transition-all flex items-center gap-1.5 border border-emerald-500/50 shadow-sm shadow-emerald-900/40"
+                title="Mount EnCase E01 or Raw DD/RAW Bitstream Disk Images"
+              >
+                <HardDrive className="w-3.5 h-3.5" /> Mount Disk Image
+              </button>
+
               <button 
                 onClick={() => setIsLoadModalOpen(true)} 
                 className="bg-blue-600 hover:bg-blue-500 text-white px-3.5 py-1 rounded text-[10px] font-bold uppercase transition-all flex items-center gap-1.5 border border-blue-500/50 shadow-sm shadow-blue-900/40"
@@ -241,7 +285,7 @@ export default function App() {
                 <FolderSearch className="w-3.5 h-3.5" /> Load Folder
               </button>
               <button onClick={() => fileInputRef.current?.click()} className="bg-zinc-900 hover:bg-zinc-800 text-zinc-400 hover:text-white px-3 py-1 rounded text-[10px] font-bold uppercase transition-all flex items-center gap-2 border border-zinc-800">
-                <Plus className="w-3.5 h-3.5" /> Ad-hoc Image
+                <Plus className="w-3.5 h-3.5" /> Select Files
               </button>
               <input type="file" multiple ref={fileInputRef} onChange={handleAddFiles} className="hidden" />
               <input type="file" multiple ref={dirInputRef} onChange={handleAddFiles} className="hidden" {...{ webkitdirectory: "", directory: "" } as any} />
@@ -318,18 +362,24 @@ export default function App() {
               <div className="w-20 h-20 bg-blue-600/10 rounded-full flex items-center justify-center mb-6 border border-blue-500/20">
                 <Database className="w-8 h-8 text-blue-500" />
               </div>
-              <h2 className="text-xl font-serif italic text-white mb-2">No Filesystem Evidence Ingested</h2>
-              <p className="text-zinc-500 max-w-md text-xs mb-8 leading-relaxed">
-                Drag and drop evidence files, raw disk images, or entire directory trees. You can also explore collected registry/browser artifacts using the Artifacts mode.
+              <h2 className="text-xl font-serif italic text-white mb-2">No Forensic Evidence Ingested</h2>
+              <p className="text-zinc-500 max-w-lg text-xs mb-8 leading-relaxed">
+                Mount full forensic disk bitstream images (<span className="text-emerald-400 font-mono font-bold">.E01, .dd, .raw, .001</span>) to automatically parse partition tables (MBR/GPT) and reconstruct filesystem trees with deleted file recovery. You can also ingest live directory dumps or analyze endpoint forensic artifacts.
               </p>
-              <div className="flex gap-3">
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <button 
+                  onClick={() => setIsDiskModalOpen(true)} 
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-2 rounded font-bold uppercase text-[10px] tracking-widest transition-all flex items-center gap-1.5 shadow-lg shadow-emerald-900/30 border border-emerald-500/40"
+                >
+                  <HardDrive className="w-3.5 h-3.5" /> Mount Disk Image (E01 / DD)
+                </button>
                 <button 
                   onClick={() => setIsLoadModalOpen(true)} 
                   className="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded font-bold uppercase text-[10px] tracking-widest transition-all flex items-center gap-1.5 shadow-lg shadow-blue-900/30"
                 >
                   <Layers className="w-3.5 h-3.5" /> Load Artifact File
                 </button>
-                <button onClick={() => dirInputRef.current?.click()} className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 px-5 py-2 rounded font-bold uppercase text-[10px] tracking-widest transition-all">
+                <button onClick={() => dirInputRef.current?.click()} className="bg-zinc-850 hover:bg-zinc-800 text-zinc-300 px-5 py-2 rounded font-bold uppercase text-[10px] tracking-widest transition-all border border-zinc-800">
                   Ingest Directory
                 </button>
                 <button onClick={() => fileInputRef.current?.click()} className="bg-zinc-900 hover:bg-zinc-850 text-zinc-400 px-5 py-2 rounded font-bold uppercase text-[10px] tracking-widest transition-all border border-zinc-800">
@@ -342,18 +392,40 @@ export default function App() {
               {/* Panel 2: File Listing (Encase Top view) */}
               <div className="flex-[0.5] min-h-0 flex flex-col">
                 <div className="h-8 bg-zinc-900/30 flex items-center px-4 border-b border-zinc-900 text-[10px] font-bold text-zinc-500 gap-2">
-                  <div className="flex items-center gap-1">
-                    <HardDrive className="w-3 h-3" />
-                    <span>C:</span>
+                  <div className="flex items-center gap-1.5">
+                    {currentFolder?.isDiskImage ? (
+                      <HardDrive className="w-3.5 h-3.5 text-blue-400" />
+                    ) : currentFolder?.isPartition ? (
+                      <Database className="w-3.5 h-3.5 text-emerald-400" />
+                    ) : (
+                      <HardDrive className="w-3.5 h-3.5 text-zinc-400" />
+                    )}
+                    <span className="text-zinc-300">
+                      {currentFolder?.isDiskImage ? 'DISK IMAGE' : currentFolder?.isPartition ? 'PARTITION' : 'VOLUME'}
+                    </span>
                   </div>
+
                   {(selectedFolderId || '').split('/').filter(Boolean).map((part, i) => (
                     <React.Fragment key={i}>
-                      <ChevronRight className="w-3 h-3 text-zinc-700" />
-                      <span>{part}</span>
+                      <ChevronRight className="w-3 h-3 text-zinc-700 shrink-0" />
+                      <span className="truncate max-w-[200px] text-zinc-400">{part}</span>
                     </React.Fragment>
                   ))}
-                  <div className="ml-auto flex items-center gap-2">
-                     <Filter className="w-3 h-3" />
+
+                  {currentFolder?.filesystemType && (
+                    <span className="ml-1 px-1.5 py-0.5 rounded text-[8px] font-mono bg-zinc-850 text-zinc-300 border border-zinc-700 shrink-0">
+                      {currentFolder.filesystemType}
+                    </span>
+                  )}
+
+                  {currentFolder?.deletedFileCount && currentFolder.deletedFileCount > 0 ? (
+                    <span className="ml-1 px-1.5 py-0.5 rounded text-[8px] font-mono font-bold bg-red-950 text-red-400 border border-red-900/60 shrink-0">
+                      {currentFolder.deletedFileCount} RECOVERED DELETED
+                    </span>
+                  ) : null}
+
+                  <div className="ml-auto flex items-center gap-2 shrink-0">
+                     <Filter className="w-3 h-3 text-zinc-600" />
                      <span>{filesInView.length} objects</span>
                   </div>
                 </div>
@@ -384,6 +456,12 @@ export default function App() {
             <span className="text-blue-400">ARTIFACTS: {artifacts.length}</span>
             <div className="h-3 w-px bg-zinc-900" />
             <span className="text-red-400">IOC FLAGS: {artifacts.filter(a => a.isSuspicious).length}</span>
+            {mountedImages.length > 0 && (
+              <>
+                <div className="h-3 w-px bg-zinc-900" />
+                <span className="text-emerald-400">IMAGES: {mountedImages.length} ({mountedImages.map(m => m.format).join(', ')})</span>
+              </>
+            )}
           </div>
           <div className="flex gap-4">
             <span className="text-zinc-500">USER: ANALYST-01</span>
@@ -396,6 +474,13 @@ export default function App() {
           isOpen={isLoadModalOpen}
           onClose={() => setIsLoadModalOpen(false)}
           onArtifactsLoaded={handleArtifactsLoaded}
+        />
+
+        {/* Modal: Mount & Parse Forensic Disk Images (E01, DD, RAW) */}
+        <LoadDiskImageModal
+          isOpen={isDiskModalOpen}
+          onClose={() => setIsDiskModalOpen(false)}
+          onDiskImageLoaded={handleDiskImageLoaded}
         />
       </div>
     </div>
